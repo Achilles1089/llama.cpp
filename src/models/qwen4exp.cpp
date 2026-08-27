@@ -1167,11 +1167,25 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
         // split_equal's n_keep_tail guarantee that the last K tokens share a ubatch.
         const int64_t K = (int64_t) cparams.n_rs_seq + 1;
 
+        // default: the snapshot-scatter op writes all K slots in one dispatch,
+        // with the per-slot source clamp done in-kernel (no ubatch-shape guard
+        // needed). Kill switch falls back to the K cont+cpy loop below.
+        static const bool snap_scatter_disable = getenv("GGML_SNAP_SCATTER_DISABLE") != nullptr;
+
         // opt-in only: the negative-stride single-cpy trips ggml's size math
         // (wrapped nb3 breaks ggml_nbytes-based asserts). The honest fused form
-        // is a small snapshot-scatter kernel — on the ledger, not built.
+        // is the snapshot-scatter op above it.
         static const bool snap_fuse_enable = getenv("GGML_CONV_SNAP_FUSE_ENABLE") != nullptr;
-        if (snap_fuse_enable && conv_input->ne[0] - state_cols >= K - 1) {
+
+        if (!snap_scatter_disable) {
+            ggml_tensor * dsts = ggml_view_3d(ctx0, conv_states_all,
+                    state_cols * channels, n_seqs, K,
+                    conv_states_all->nb[1],
+                    mem_size * row_size,
+                    kv_head * row_size);
+
+            ggml_build_forward_expand(gf, ggml_conv_snap_scatter(ctx0, conv_input, dsts));
+        } else if (snap_fuse_enable && conv_input->ne[0] - state_cols >= K - 1) {
             // the K snapshot sources step by exactly one column (slot K-1 is the
             // oldest), so the whole set is ONE strided 4D copy instead of K
             // dispatches — under draft-6 speculation this replaces 7 cpys per

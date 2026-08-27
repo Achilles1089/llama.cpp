@@ -576,6 +576,7 @@ extern "C" {
         GGML_OP_DSV4_HC_POST,
         GGML_OP_HC_MIX,
         GGML_OP_HC_COMBINE,
+        GGML_OP_CONV_SNAP_SCATTER,
 
         GGML_OP_UNARY,
 
@@ -2649,6 +2650,16 @@ extern "C" {
             struct ggml_tensor  * residual,
             struct ggml_tensor  * block_out,
             struct ggml_tensor  * inject);
+
+    // speculative-rollback conv state snapshots, all K slots in one op:
+    //   src    [ne0, channels, n_seqs]           conv input (history + new tokens)
+    //   states [state_cols*channels, n_seqs, K]  slot view; may stride freely on ne[1]/ne[2]
+    // slot k copies src columns [max(0, ne0 - state_cols - k), +state_cols) per
+    // channel into its row, replacing K cont+cpy pairs. Returns a view of states.
+    GGML_API struct ggml_tensor * ggml_conv_snap_scatter(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * src,
+            struct ggml_tensor  * states);
 
     GGML_API struct ggml_tensor * ggml_dsv4_hc_comb(
             struct ggml_context * ctx,

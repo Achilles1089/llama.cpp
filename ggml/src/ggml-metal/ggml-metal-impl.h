@@ -923,6 +923,7 @@ typedef struct {
     uint64_t nb0;
     uint64_t nb1;
     uint64_t nb2;
+    int32_t  act;   // 1 = fused silu on the store
 } ggml_metal_kargs_ssm_conv;
 
 typedef struct {
@@ -1302,6 +1303,16 @@ typedef struct {
     uint64_t nb_i1;         // inject token stride
     uint64_t nb_d2;         // dst token stride
 } ggml_metal_kargs_hc_combine;
+
+typedef struct {
+    int32_t  ne00;          // src cols (history + tokens)
+    int32_t  state_cols;
+    int32_t  channels;
+    uint64_t nb01;          // src channel stride
+    uint64_t nb02;          // src seq stride
+    uint64_t nb11;          // dst seq stride
+    uint64_t nb12;          // dst slot stride
+} ggml_metal_kargs_conv_snap_scatter;
 
 typedef struct {
     int32_t  n_embd;

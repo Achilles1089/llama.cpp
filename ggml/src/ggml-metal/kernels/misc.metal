@@ -764,3 +764,33 @@ kernel void kernel_hc_combine_f32(
         o[j] = r[j] + b[i]*w;
     }
 }
+
+// speculative-rollback conv snapshots: slot k copies the state_cols-wide tail
+// of src ending (K-1-k)... i.e. starting at max(0, ne00 - state_cols - k), per
+// channel, into its strided state row. One dispatch replaces K cont+cpy pairs.
+kernel void kernel_conv_snap_scatter_f32(
+        constant ggml_metal_kargs_conv_snap_scatter & args,
+        device const char * src0,
+        device       char * dst,
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        uint3 tpitg[[thread_position_in_threadgroup]],
+        uint3   ntg[[threads_per_threadgroup]]) {
+    const int     seq = tgpig.y;
+    const int     k   = tgpig.z;
+    const int64_t row_total = (int64_t) args.state_cols*args.channels;
+
+    const int64_t e = (int64_t) tgpig.x*ntg.x + tpitg.x;
+    if (e >= row_total) {
+        return;
+    }
+
+    const int32_t chan = e/args.state_cols;
+    const int32_t col  = e - chan*args.state_cols;
+
+    const int32_t s_idx = max(0, args.ne00 - args.state_cols - k);
+
+    device const float * s = (device const float *) (src0 + (int64_t) chan*args.nb01 + (int64_t) seq*args.nb02);
+    device       float * d = (device       float *) (dst  + (int64_t) seq*args.nb11  + (int64_t) k*args.nb12);
+
+    d[e] = s[s_idx + col];
+}

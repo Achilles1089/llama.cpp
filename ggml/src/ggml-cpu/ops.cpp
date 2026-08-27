@@ -11294,6 +11294,45 @@ void ggml_compute_forward_hc_combine(
     ggml_compute_forward_hc_combine_f32(params, dst);
 }
 
+// ggml_compute_forward_conv_snap_scatter
+
+void ggml_compute_forward_conv_snap_scatter(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0]; // conv input [ne00, channels, n_seqs]
+    const ggml_tensor * src1 = dst->src[1]; // states view [state_cols*channels, n_seqs, K]
+
+    GGML_ASSERT(src0->type == GGML_TYPE_F32);
+    GGML_ASSERT(src1->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(src0));
+
+    const int64_t ne00       = src0->ne[0];
+    const int64_t channels   = src0->ne[1];
+    const int64_t n_seqs     = src0->ne[2];
+    const int64_t K          = src1->ne[2];
+    const int64_t state_cols = src1->ne[0] / channels;
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    // one work item = one (channel, seq, slot) row segment of state_cols floats
+    const int64_t nwork = channels * n_seqs * K;
+
+    for (int64_t w = ith; w < nwork; w += nth) {
+        const int64_t k    = w / (channels * n_seqs);
+        const int64_t rem  = w % (channels * n_seqs);
+        const int64_t seq  = rem / channels;
+        const int64_t chan = rem % channels;
+
+        const int64_t s_idx = MAX((int64_t) 0, ne00 - state_cols - k);
+
+        const float * sp = (const float *) ((const char *) src0->data + chan*src0->nb[1] + seq*src0->nb[2]) + s_idx;
+        float       * dp = (float *)       ((char *)       dst->data  + seq*dst->nb[1]   + k*dst->nb[2])   + chan*state_cols;
+
+        memcpy(dp, sp, state_cols*sizeof(float));
+    }
+}
+
 // ggml_compute_forward_dsv4_hc_post
 
 static void ggml_compute_forward_dsv4_hc_post_f32(

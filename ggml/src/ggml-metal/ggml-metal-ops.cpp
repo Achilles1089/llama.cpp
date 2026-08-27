@@ -347,6 +347,10 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
             {
                 n_fuse = ggml_metal_op_hc(ctx, idx);
             } break;
+        case GGML_OP_CONV_SNAP_SCATTER:
+            {
+                n_fuse = ggml_metal_op_conv_snap_scatter(ctx, idx);
+            } break;
         case GGML_OP_SOFT_MAX:
             {
                 n_fuse = ggml_metal_op_soft_max(ctx, idx);
@@ -1489,6 +1493,43 @@ int ggml_metal_op_hc(ggml_metal_op_t ctx, int idx) {
     return 1;
 }
 
+int ggml_metal_op_conv_snap_scatter(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    const ggml_tensor * src0 = op->src[0]; // conv input [ne00, channels, n_seqs]
+    const ggml_tensor * src1 = op->src[1]; // states view [state_cols*channels, n_seqs, K]
+
+    auto pipeline = ggml_metal_library_get_pipeline_hc(ctx->lib, op->op);
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+
+    const int32_t channels   = (int32_t) src0->ne[1];
+    const int32_t state_cols = (int32_t) (src1->ne[0] / src0->ne[1]);
+
+    ggml_metal_kargs_conv_snap_scatter args = {
+        /*.ne00       =*/ (int32_t) src0->ne[0],
+        /*.state_cols =*/ state_cols,
+        /*.channels   =*/ channels,
+        /*.nb01       =*/ src0->nb[1],
+        /*.nb02       =*/ src0->nb[2],
+        /*.nb11       =*/ op->nb[1],
+        /*.nb12       =*/ op->nb[2],
+    };
+
+    ggml_metal_encoder_set_bytes (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(src0), 1);
+    ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op),   2);
+
+    const int64_t row_total = (int64_t) state_cols*channels;
+    const int nth = 256;
+
+    ggml_metal_encoder_dispatch_threadgroups(enc,
+            (int) ((row_total + nth - 1)/nth), (int) src0->ne[2], (int) src1->ne[2], nth, 1, 1);
+
+    return 1;
+}
+
 int ggml_metal_op_dsv4_hc(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * op = ctx->node(idx);
 
@@ -1889,6 +1930,26 @@ int ggml_metal_op_ssm_conv(ggml_metal_op_t ctx, int idx) {
     GGML_TENSOR_LOCALS( int32_t, ne,  op,         ne);
     GGML_TENSOR_LOCALS(uint64_t, nb,  op,         nb);
 
+    // fuse a directly-following silu into the conv store (the GDN spine emits
+    // ssm_conv -> silu back to back); dst becomes the silu node
+    int n_fuse = 1;
+    ggml_tensor * out = op;
+    {
+        static const bool silu_fuse_disable = getenv("GGML_SSM_CONV_SILU_DISABLE") != nullptr;
+
+        const ggml_op fops[2] = { GGML_OP_SSM_CONV, GGML_OP_UNARY };
+
+        if (!silu_fuse_disable && ctx->use_fusion && ctx->can_fuse(idx, fops, 2)) {
+            ggml_tensor * f1 = ctx->node(idx + 1);
+
+            if (ggml_get_unary_op(f1) == GGML_UNARY_OP_SILU && f1->src[0] == op &&
+                ggml_are_same_layout(f1, op)) {
+                out    = f1;
+                n_fuse = 2;
+            }
+        }
+    }
+
     ggml_metal_kargs_ssm_conv args = {
         /*.ne00 =*/ ne00,
         /*.ne01 =*/ ne01,
@@ -1906,6 +1967,7 @@ int ggml_metal_op_ssm_conv(ggml_metal_op_t ctx, int idx) {
         /*.nb0  =*/ nb0,
         /*.nb1  =*/ nb1,
         /*.nb2  =*/ nb2,
+        /*.act  =*/ n_fuse == 2 ? 1 : 0,
     };
 
     // Use batched kernel for prefill (ne1 > 1) to reduce threadgroup dispatch overhead
@@ -1928,7 +1990,7 @@ int ggml_metal_op_ssm_conv(ggml_metal_op_t ctx, int idx) {
         ggml_metal_encoder_set_bytes(enc, &args, sizeof(args), 0);
         ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op->src[0]), 1);
         ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op->src[1]), 2);
-        ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op),         3);
+        ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(out),        3);
 
         // Dispatch: ne01 rows, ceil(ne1/BATCH_SIZE) token batches, ne02 sequences
         // Each threadgroup has BATCH_SIZE threads, each handling one token
@@ -1941,12 +2003,12 @@ int ggml_metal_op_ssm_conv(ggml_metal_op_t ctx, int idx) {
         ggml_metal_encoder_set_bytes(enc, &args, sizeof(args), 0);
         ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op->src[0]), 1);
         ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op->src[1]), 2);
-        ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op),         3);
+        ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(out),        3);
 
         ggml_metal_encoder_dispatch_threadgroups(enc, ne01, ne1, ne02, 1, 1, 1);
     }
 
-    return 1;
+    return n_fuse;
 }
 
 int ggml_metal_op_ssm_scan(ggml_metal_op_t ctx, int idx) {

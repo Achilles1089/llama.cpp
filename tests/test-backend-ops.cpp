@@ -4793,6 +4793,41 @@ struct test_hc_combine : public test_case {
     }
 };
 
+// qwen4exp speculative-rollback conv snapshots: K slot rows written in one op
+struct test_conv_snap_scatter : public test_case {
+    const int64_t state_cols, channels, n_tokens, n_seqs, K, mem_size;
+
+    std::string vars() override {
+        return VARS_TO_STR6(state_cols, channels, n_tokens, n_seqs, K, mem_size);
+    }
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "CONV_SNAP_SCATTER"; }
+    double max_nmse_err() override { return 0.0; } // pure copy, must be exact
+
+    test_conv_snap_scatter(int64_t state_cols = 3, int64_t channels = 32,
+                           int64_t n_tokens = 7, int64_t n_seqs = 2,
+                           int64_t K = 7, int64_t mem_size = 3)
+        : state_cols(state_cols), channels(channels), n_tokens(n_tokens),
+          n_seqs(n_seqs), K(K), mem_size(mem_size) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t row_total = state_cols*channels;
+
+        ggml_tensor * src = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, state_cols + n_tokens, channels, n_seqs);
+        ggml_set_name(src, "src");
+
+        // slots stride mem_size rows, as the mirrored-row cache layout does
+        ggml_tensor * states = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, row_total, mem_size*K);
+        ggml_set_name(states, "states");
+
+        ggml_tensor * dsts = ggml_view_3d(ctx, states, row_total, n_seqs, K,
+                states->nb[1], mem_size*states->nb[1], 0);
+
+        ggml_tensor * out = ggml_conv_snap_scatter(ctx, src, dsts);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // MoE decode aggregation tail as emitted by build_moe_ffn:
 //   experts = mul_mat_id(down_exps, act, ids); experts = mul(experts, weights);
 //   out = sum over per-slot views (add chain)
@@ -10168,6 +10203,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     test_cases.emplace_back(new test_hc_combine(64, 4, 1));
     test_cases.emplace_back(new test_hc_combine(2560, 4, 3));
+    test_cases.emplace_back(new test_conv_snap_scatter(3, 32, 7, 2, 7, 3));   // draft-6 shape
+    test_cases.emplace_back(new test_conv_snap_scatter(3, 32, 2, 1, 7, 2));   // clamp active (few tokens)
+    test_cases.emplace_back(new test_conv_snap_scatter(6, 64, 1, 1, 7, 1));   // PLE-like, single token
+    test_cases.emplace_back(new test_conv_snap_scatter(3, 8192, 7, 1, 7, 1)); // GDN-scale row
 
     // Metal fused down + route-weights + expert reduce at MoE decode shapes:
     // the exact build_moe_ffn aggregation tail (mmid -> mul -> views -> add chain)

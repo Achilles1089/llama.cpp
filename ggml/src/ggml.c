@@ -1085,6 +1085,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "DSV4_HC_POST",
     "HC_MIX",
     "HC_COMBINE",
+    "CONV_SNAP_SCATTER",
 
     "UNARY",
 
@@ -1102,7 +1103,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1202,6 +1203,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "dsv4_hc_post(x, residual, post, comb)",
     "hc_mix(x, gamma, down, up)",
     "hc_combine(residual, block_out, inject)",
+    "conv_snap_scatter(src, states)",
 
     "unary(x)",
 
@@ -1219,7 +1221,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6542,6 +6544,38 @@ struct ggml_tensor * ggml_hc_combine(
     result->src[0] = residual;
     result->src[1] = block_out;
     result->src[2] = inject;
+
+    return result;
+}
+
+
+// ggml_conv_snap_scatter
+
+struct ggml_tensor * ggml_conv_snap_scatter(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * src,
+        struct ggml_tensor  * states) {
+    GGML_ASSERT(src->type    == GGML_TYPE_F32);
+    GGML_ASSERT(states->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(src));
+    GGML_ASSERT(states->nb[0] == sizeof(float)); // rows dense, slot/seq strides free
+
+    const int64_t channels = src->ne[1];
+
+    GGML_ASSERT(channels > 0 && states->ne[0] % channels == 0);
+    const int64_t state_cols = states->ne[0] / channels;
+
+    GGML_ASSERT(state_cols <= src->ne[0]);
+    GGML_ASSERT(states->ne[1] == src->ne[2]); // n_seqs
+    GGML_ASSERT(states->ne[3] == 1);
+
+    // like ggml_cpy: the result is a view of the destination
+    struct ggml_tensor * result = ggml_view_tensor(ctx, states);
+    ggml_format_name(result, "%s (snap)", states->name);
+
+    result->op     = GGML_OP_CONV_SNAP_SCATTER;
+    result->src[0] = src;
+    result->src[1] = states;
 
     return result;
 }

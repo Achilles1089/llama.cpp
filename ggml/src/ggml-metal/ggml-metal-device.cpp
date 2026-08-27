@@ -512,6 +512,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_hc(ggml_metal_li
 
     switch (op) {
         case GGML_OP_HC_COMBINE: name = "kernel_hc_combine_f32"; break;
+        case GGML_OP_CONV_SNAP_SCATTER: name = "kernel_conv_snap_scatter_f32"; break;
         default: GGML_ABORT("fatal error");
     }
 
