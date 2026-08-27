@@ -287,6 +287,18 @@ static void llama_tensor_dequantize_impl(
 //
 
 static bool tensor_allows_quantization(const llama_model_quantize_params * params, llm_arch arch, const ggml_tensor * tensor) {
+    // an explicit --tensor-type pattern naming this tensor wins over every
+    // exclusion below, including only_copy: COPY + --tensor-type is the
+    // surgical-requant path (retype the named tensors, copy the rest)
+    if (params->tt_overrides && ggml_n_dims(tensor) >= 2) {
+        const std::string name = ggml_get_name(tensor);
+        for (const auto * p = params->tt_overrides; p->pattern != nullptr; p++) {
+            if (std::regex_search(name, std::regex(p->pattern))) {
+                return true;
+            }
+        }
+    }
+
     // trivial checks first -- no string ops needed
     if (params->only_copy)       return false;
 
@@ -708,6 +720,23 @@ static ggml_type llama_tensor_get_type(quantize_state_impl & qs, const llama_mod
     }
 
     ggml_type new_type = default_type;
+
+    // explicit --tensor-type patterns are user intent: honor them before the
+    // is_quantized(default_type) guard below. COPY aliases to ALL_F32 whose
+    // default type is not quantized, which otherwise skips the manual-override
+    // block entirely and silently copies the named tensors unchanged.
+    if (!qs.tensor_type_patterns.empty()) {
+        const std::string tensor_name(tensor->name);
+        for (const auto & [pattern, qtype] : qs.tensor_type_patterns) {
+            if (std::regex_search(tensor_name, pattern)) {
+                if (qtype != tensor->type) {
+                    LLAMA_LOG_WARN("%s: %-36s - applying manual override: %s -> %s\n",
+                                   __func__, tensor_name.c_str(), ggml_type_name(tensor->type), ggml_type_name(qtype));
+                }
+                return tensor_type_fallback(qs, tensor, qtype);
+            }
+        }
+    }
 
     // get more optimal quantization type based on the tensor shape, layer, etc.
     if (ggml_is_quantized(default_type)) {
