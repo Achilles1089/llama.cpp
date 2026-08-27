@@ -661,6 +661,23 @@ typedef struct {
 } ggml_metal_kargs_topk_moe;
 
 typedef struct {
+    int32_t  ne00;          // k (activation length)
+    int32_t  ne01;          // rows per expert (= glu dst ne0)
+    int32_t  ne02;          // n_expert
+    uint64_t nb01;          // weight row stride (bytes)
+    uint64_t nb02;          // weight expert stride (bytes)
+} ggml_metal_kargs_mul_mv_id_glu;
+
+typedef struct {
+    int32_t  ne00;          // k (expert FFN width)
+    int32_t  ne01;          // output rows (n_embd)
+    int32_t  ne02;          // n_expert
+    int32_t  n_used;        // expert slots to accumulate
+    uint64_t nb01;          // weight row stride (bytes)
+    uint64_t nb02;          // weight expert stride (bytes)
+} ggml_metal_kargs_mul_mv_id_reduce;
+
+typedef struct {
     int32_t  IC;
     int32_t  IH;
     int32_t  IW;

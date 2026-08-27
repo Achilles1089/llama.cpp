@@ -420,6 +420,87 @@ void ggml_graph_optimize(ggml_cgraph * gf) {
             }
         }
 
+        // mmid-glu: pack the {MUL_MAT_ID, MUL_MAT_ID, GLU} span (fused MoE
+        // up+gate+swiglu at decode) so the concurrency reorder cannot split it —
+        // the Metal encoder fuses it into one kernel (ggml_metal_op_mul_mv_id_glu)
+        if (node.op() == GGML_OP_MUL_MAT_ID && i + 3 <= n) {
+            static constexpr ggml_op mmid_glu_ops[3] = {
+                GGML_OP_MUL_MAT_ID, GGML_OP_MUL_MAT_ID, GGML_OP_GLU,
+            };
+
+            bool match = gf->nodes[i + 1]->op == GGML_OP_MUL_MAT_ID &&
+                         gf->nodes[i + 2]->op == GGML_OP_GLU;
+
+            if (match) {
+                ggml_tensor * glu = gf->nodes[i + 2];
+                match = glu->src[0] == gf->nodes[i + 0] &&
+                        glu->src[1] == gf->nodes[i + 1] &&
+                        ggml_get_glu_op(glu) == GGML_GLU_OP_SWIGLU &&
+                        gf->nodes[i + 0]->src[0]->type == GGML_TYPE_Q4_K &&
+                        gf->nodes[i + 1]->src[0]->type == GGML_TYPE_Q4_K &&
+                        gf->nodes[i + 0]->ne[2] == 1;
+            }
+
+            const int outs1[1] = { i + 2 };
+            if (match && ggml_can_fuse_subgraph(gf, i, 3, mmid_glu_ops, outs1, 1)) {
+                for (int k = 1; k < 3; ++k) {
+                    ++i;
+                    node.add_fused(gf->nodes[i]);
+                }
+
+                nodes.push_back(std::move(node));
+                continue;
+            }
+        }
+
+        // mmid-reduce: pack the {MUL_MAT_ID, MUL, VIEW x n + ADD x n-1} span
+        // (fused MoE down + route-weights + expert aggregation at decode; views
+        // and adds may interleave) — encoder is ggml_metal_op_mul_mv_id_reduce
+        if (node.op() == GGML_OP_MUL_MAT_ID && i + 2 <= n &&
+            gf->nodes[i + 1]->op == GGML_OP_MUL &&
+            gf->nodes[i + 1]->src[0] == gf->nodes[i] &&
+            gf->nodes[i]->src[2] != nullptr &&
+            gf->nodes[i]->src[0]->type == GGML_TYPE_Q5_1 &&
+            gf->nodes[i]->ne[2] == 1) {
+            const int n_used = (int) gf->nodes[i]->src[2]->ne[0];
+            const int n_span = 2 + n_used + (n_used - 1);
+
+            if (n_used >= 2 && n_used <= 16 && i + n_span <= n) {
+                ggml_op ops_r[2 + 16 + 15];
+                ops_r[0] = GGML_OP_MUL_MAT_ID;
+                ops_r[1] = GGML_OP_MUL;
+
+                int nv = 0;
+                int na = 0;
+                bool match = true;
+                for (int k = 2; k < n_span; ++k) {
+                    const ggml_op op_k = gf->nodes[i + k]->op;
+                    ops_r[k] = op_k;
+                    if (op_k == GGML_OP_VIEW && nv < n_used) {
+                        ++nv;
+                    } else if (op_k == GGML_OP_ADD && na < n_used - 1) {
+                        ++na;
+                    } else {
+                        match = false;
+                        break;
+                    }
+                }
+                match = match && nv == n_used && na == n_used - 1 &&
+                        gf->nodes[i + n_span - 1]->op == GGML_OP_ADD;
+
+                const int outs_r[1] = { i + n_span - 1 };
+                if (match && ggml_can_fuse_subgraph(gf, i, n_span, ops_r, outs_r, 1)) {
+                    for (int k = 1; k < n_span; ++k) {
+                        ++i;
+                        node.add_fused(gf->nodes[i]);
+                    }
+
+                    nodes.push_back(std::move(node));
+                    continue;
+                }
+            }
+        }
+
         // fuse only ops that start with these operations
         // can be expanded when needed
         if (node.op() == GGML_OP_ADD ||

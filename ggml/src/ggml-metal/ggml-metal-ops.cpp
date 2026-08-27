@@ -2765,7 +2765,376 @@ size_t ggml_metal_op_mul_mat_id_extra_ids(const ggml_tensor * op) {
     return ggml_type_size(GGML_TYPE_I32)*ne02*ne21;
 }
 
+// Fused MoE expert-FFN front half at decode: matches the 3-node raw span
+// MUL_MAT_ID (gate) -> MUL_MAT_ID (up) -> GLU(SWIGLU, split) emitted by
+// build_moe_ffn and replaces its 3 dispatches (and interior barriers) with one
+// dual-dot kernel that applies silu(gate)*up in registers. Metal port of the
+// CUDA mmvq has_fusion path (ggml-cuda/mmvq.cu). Returns 3 (filtered nodes
+// consumed) on fusion, 0 to fall through to the unfused path.
+static int ggml_metal_op_mul_mv_id_glu(ggml_metal_op_t ctx, int idx) {
+    static const bool disabled = getenv("GGML_METAL_MMID_GLU_DISABLE") != nullptr;
+    if (disabled) {
+        return 0;
+    }
+
+    const ggml_cgraph * gf = ctx->graph();
+
+    const int i0 = ctx->idx_raw(idx);
+
+    static constexpr ggml_op MMID_GLU_OPS[3] = {
+        GGML_OP_MUL_MAT_ID, GGML_OP_MUL_MAT_ID, GGML_OP_GLU,
+    };
+
+    if (i0 + 3 > gf->n_nodes) {
+        return 0;
+    }
+    for (int k = 0; k < 3; ++k) {
+        if (gf->nodes[i0 + k]->op != MMID_GLU_OPS[k]) {
+            return 0;
+        }
+    }
+
+    // the filtered window must map exactly onto the raw span (all 3 ops are
+    // non-empty; a foreign interleaved node would break this)
+    if (idx + 2 >= ctx->n_nodes() ||
+        ctx->node(idx + 1) != gf->nodes[i0 + 1] ||
+        ctx->node(idx + 2) != gf->nodes[i0 + 2]) {
+        return 0;
+    }
+
+    const int outs[1] = { i0 + 2 };
+    if (!ggml_can_fuse_subgraph(gf, i0, 3, MMID_GLU_OPS, outs, 1)) {
+        return 0;
+    }
+
+    ggml_tensor * gate = gf->nodes[i0 + 0];
+    ggml_tensor * up   = gf->nodes[i0 + 1];
+    ggml_tensor * glu  = gf->nodes[i0 + 2];
+
+    // src wiring: closure is proven by can_fuse_subgraph, this pins the DAG
+    if (glu->src[0] != gate || glu->src[1] != up) {
+        return 0;
+    }
+    if (ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU) {
+        return 0;
+    }
+    if (ggml_get_op_params_i32(glu, 1) != 0) { // swapped operands
+        return 0;
+    }
+
+    // both matvecs must share activations and expert ids
+    if (gate->src[1] != up->src[1] || gate->src[2] != up->src[2]) {
+        return 0;
+    }
+
+    ggml_tensor * wg  = gate->src[0];
+    ggml_tensor * wu  = up->src[0];
+    ggml_tensor * x   = gate->src[1];
+    ggml_tensor * ids = gate->src[2];
+
+    if (wg->type != GGML_TYPE_Q4_K || wu->type != GGML_TYPE_Q4_K) {
+        return 0;
+    }
+    if (!ggml_are_same_shape(wg, wu) || wg->nb[1] != wu->nb[1] || wg->nb[2] != wu->nb[2]) {
+        return 0;
+    }
+    if (wg->ne[0] % 256 != 0) { // QK_K
+        return 0;
+    }
+
+    // decode only: one token, activations broadcast across the expert slots
+    if (gate->ne[2] != 1 || ids->ne[1] != 1 || x->ne[1] != 1 || x->ne[2] != 1) {
+        return 0;
+    }
+    if (x->type != GGML_TYPE_F32 || !ggml_is_contiguous(x)) {
+        return 0;
+    }
+    if (ids->type != GGML_TYPE_I32) {
+        return 0;
+    }
+    if (glu->type != GGML_TYPE_F32 || !ggml_is_contiguous(glu)) {
+        return 0;
+    }
+    if (glu->ne[0] != wg->ne[1] || glu->ne[1] != ids->ne[0]) {
+        return 0;
+    }
+
+    // alias hazard: the fused kernel reads x/ids while writing dst; make sure
+    // the graph allocator did not overlay dst onto a live input region (the
+    // upstream expert-reduce revert lesson)
+    {
+        const ggml_metal_buffer_id bx = ggml_metal_get_buffer_id(x);
+        const ggml_metal_buffer_id bi = ggml_metal_get_buffer_id(ids);
+        const ggml_metal_buffer_id bd = ggml_metal_get_buffer_id(glu);
+
+        const size_t d0 = bd.offs;
+        const size_t d1 = bd.offs + ggml_nbytes(glu);
+
+        if ((bx.metal == bd.metal && bx.offs < d1 && bx.offs + ggml_nbytes(x)   > d0) ||
+            (bi.metal == bd.metal && bi.offs < d1 && bi.offs + ggml_nbytes(ids) > d0)) {
+            return 0;
+        }
+    }
+
+    // interior fused nodes: same concurrency discipline as the topk-moe fusion
+    for (int k = 1; k <= 2; ++k) {
+        if (!ggml_metal_op_concurrency_check(ctx, ctx->node(idx + k))) {
+            ggml_metal_op_concurrency_reset(ctx);
+
+            break;
+        }
+    }
+
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    auto pipeline = ggml_metal_library_get_pipeline_mul_mv_id_glu(ctx->lib, wg->type, GGML_GLU_OP_SWIGLU);
+
+    ggml_metal_kargs_mul_mv_id_glu args = {
+        /*.ne00 =*/ (int32_t) wg->ne[0],
+        /*.ne01 =*/ (int32_t) wg->ne[1],
+        /*.ne02 =*/ (int32_t) wg->ne[2],
+        /*.nb01 =*/ wg->nb[1],
+        /*.nb02 =*/ wg->nb[2],
+    };
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(wg),  1);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(wu),  2);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(x),   3);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(ids), 4);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(glu), 5);
+
+    const int n_used = (int) ids->ne[0];
+    const int nrptg  = 1*4; // MMID_GLU_NR0 * MMID_GLU_NSG
+
+    ggml_metal_encoder_dispatch_threadgroups(enc, ((int) wg->ne[1] + nrptg - 1)/nrptg, 1, n_used, 32, 4, 1);
+
+    return 3;
+}
+
+// Fused MoE expert-FFN back half at decode: matches the raw span
+// MUL_MAT_ID (down) -> MUL (route weights) -> VIEW x n_used -> ADD x (n_used-1)
+// emitted by build_moe_ffn's expert aggregation and replaces it with one kernel
+// that loops the expert slots in-registers — the [n_embd, n_used] intermediate
+// never touches device memory. NOT bit-exact vs the unfused chain (register
+// accumulation skips the intermediate stores) — gated on model parity + PPL.
+// Returns the number of filtered nodes consumed (n_used+1), 0 to fall through.
+// Fused MoE expert-FFN back half at decode: matches the raw span
+// MUL_MAT_ID (down) -> MUL (route weights) -> { VIEW x n_used + ADD x (n_used-1) }
+// (views/adds in any interleaving — build_moe_ffn emits views-then-adds, a plain
+// DFS emits them interleaved) and replaces it with one kernel that loops the
+// expert slots in-registers — the [n_embd, n_used] intermediate never touches
+// device memory. NOT bit-exact vs the unfused chain (register accumulation skips
+// the intermediate stores) — gated on model parity + PPL.
+// Returns the number of filtered nodes consumed (n_used+1), 0 to fall through.
+static int ggml_metal_op_mul_mv_id_reduce(ggml_metal_op_t ctx, int idx) {
+    static const bool disabled = getenv("GGML_METAL_MMID_REDUCE_DISABLE") != nullptr;
+    if (disabled) {
+        return 0;
+    }
+
+    const ggml_cgraph * gf = ctx->graph();
+
+    const int i0 = ctx->idx_raw(idx);
+
+    if (i0 + 2 > gf->n_nodes ||
+        gf->nodes[i0]->op != GGML_OP_MUL_MAT_ID ||
+        gf->nodes[i0 + 1]->op != GGML_OP_MUL) {
+        return 0;
+    }
+
+    ggml_tensor * mmid = gf->nodes[i0 + 0];
+    ggml_tensor * mul  = gf->nodes[i0 + 1];
+
+    ggml_tensor * ids = mmid->src[2];
+    if (!ids || ids->type != GGML_TYPE_I32 || ids->ne[1] != 1) {
+        return 0;
+    }
+
+    const int n_used = (int) ids->ne[0];
+    if (n_used < 2 || n_used > 16) {
+        return 0;
+    }
+
+    const int n_span = 2 + n_used + (n_used - 1); // mmid, mul, views, adds
+    if (i0 + n_span > gf->n_nodes) {
+        return 0;
+    }
+
+    // scan the span: exactly n_used VIEWs and n_used-1 ADDs, any interleaving;
+    // record the actual op order for can_fuse_subgraph and collect the nodes
+    ggml_op ops[2 + 16 + 15];
+    ops[0] = GGML_OP_MUL_MAT_ID;
+    ops[1] = GGML_OP_MUL;
+
+    ggml_tensor * view_nodes[16];
+    ggml_tensor * add_nodes[15];
+    int nv = 0;
+    int na = 0;
+
+    for (int k = 2; k < n_span; ++k) {
+        ggml_tensor * t = gf->nodes[i0 + k];
+        ops[k] = t->op;
+        if (t->op == GGML_OP_VIEW && nv < n_used) {
+            view_nodes[nv++] = t;
+        } else if (t->op == GGML_OP_ADD && na < n_used - 1) {
+            add_nodes[na++] = t;
+        } else {
+            return 0;
+        }
+    }
+    if (nv != n_used || na != n_used - 1) {
+        return 0;
+    }
+
+    // the filtered window (views are empty ops) must map exactly onto the span:
+    // mmid, mul, then the adds in their raw relative order
+    if (idx + n_used >= ctx->n_nodes() || ctx->node(idx + 1) != mul) {
+        return 0;
+    }
+    for (int a = 0; a < n_used - 1; ++a) {
+        if (ctx->node(idx + 2 + a) != add_nodes[a]) {
+            return 0;
+        }
+    }
+
+    const int outs[1] = { i0 + n_span - 1 };
+    if (gf->nodes[i0 + n_span - 1] != add_nodes[n_used - 2] ||
+        !ggml_can_fuse_subgraph(gf, i0, n_span, ops, outs, 1)) {
+        return 0;
+    }
+
+    // src wiring pins
+    if (mul->src[0] != mmid) {
+        return 0;
+    }
+
+    ggml_tensor * wts = mul->src[1];
+    if (!wts || wts->type != GGML_TYPE_F32 ||
+        wts->ne[0] != 1 || wts->ne[1] != n_used || wts->ne[2] != 1 || wts->ne[3] != 1 ||
+        wts->nb[1] != sizeof(float)) {
+        return 0;
+    }
+
+    // identify each view's expert slot by its byte offset into the intermediate
+    ggml_tensor * views[16] = { nullptr };
+    for (int v = 0; v < n_used; ++v) {
+        ggml_tensor * t = view_nodes[v];
+        if (t->src[0] != mul || t->ne[0] != mul->ne[0] || t->ne[1] != 1) {
+            return 0;
+        }
+        const ptrdiff_t off = (const char *) t->data - (const char *) mul->data;
+        if (off < 0 || off % (ptrdiff_t) mul->nb[1] != 0) {
+            return 0;
+        }
+        const ptrdiff_t slot = off / (ptrdiff_t) mul->nb[1];
+        if (slot >= n_used || views[slot] != nullptr) {
+            return 0;
+        }
+        views[slot] = t;
+    }
+
+    // left-to-right add chain over the slots in order
+    ggml_tensor * dst = add_nodes[0];
+    if (dst->src[0] != views[0] || dst->src[1] != views[1]) {
+        return 0;
+    }
+    for (int a = 1; a < n_used - 1; ++a) {
+        if (add_nodes[a]->src[0] != dst || add_nodes[a]->src[1] != views[a + 1]) {
+            return 0;
+        }
+        dst = add_nodes[a];
+    }
+
+    ggml_tensor * w = mmid->src[0]; // down_exps
+    ggml_tensor * x = mmid->src[1]; // activations (per-slot, from the GLU)
+
+    if (w->type != GGML_TYPE_Q5_1) {
+        return 0;
+    }
+    if (w->ne[0] % 32 != 0) { // QK5_1
+        return 0;
+    }
+
+    // decode only: one token, one activation column per expert slot
+    if (mmid->ne[2] != 1 || x->ne[1] != n_used || x->ne[2] != 1) {
+        return 0;
+    }
+    if (x->type != GGML_TYPE_F32 || !ggml_is_contiguous(x)) {
+        return 0;
+    }
+    if (dst->type != GGML_TYPE_F32 || !ggml_is_contiguous(dst) ||
+        dst->ne[0] != w->ne[1] || dst->ne[1] != 1) {
+        return 0;
+    }
+
+    // alias hazard: the fused kernel reads x/ids/wts while writing dst
+    {
+        const ggml_metal_buffer_id bx = ggml_metal_get_buffer_id(x);
+        const ggml_metal_buffer_id bi = ggml_metal_get_buffer_id(ids);
+        const ggml_metal_buffer_id bw = ggml_metal_get_buffer_id(wts);
+        const ggml_metal_buffer_id bd = ggml_metal_get_buffer_id(dst);
+
+        const size_t d0 = bd.offs;
+        const size_t d1 = bd.offs + ggml_nbytes(dst);
+
+        if ((bx.metal == bd.metal && bx.offs < d1 && bx.offs + ggml_nbytes(x)   > d0) ||
+            (bi.metal == bd.metal && bi.offs < d1 && bi.offs + ggml_nbytes(ids) > d0) ||
+            (bw.metal == bd.metal && bw.offs < d1 && bw.offs + ggml_nbytes(wts) > d0)) {
+            return 0;
+        }
+    }
+
+    // interior fused nodes: same concurrency discipline as the other fusions
+    for (int k = 1; k <= n_used; ++k) {
+        if (!ggml_metal_op_concurrency_check(ctx, ctx->node(idx + k))) {
+            ggml_metal_op_concurrency_reset(ctx);
+
+            break;
+        }
+    }
+
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    auto pipeline = ggml_metal_library_get_pipeline_mul_mv_id_reduce(ctx->lib, w->type);
+
+    ggml_metal_kargs_mul_mv_id_reduce args = {
+        /*.ne00   =*/ (int32_t) w->ne[0],
+        /*.ne01   =*/ (int32_t) w->ne[1],
+        /*.ne02   =*/ (int32_t) w->ne[2],
+        /*.n_used =*/ n_used,
+        /*.nb01   =*/ w->nb[1],
+        /*.nb02   =*/ w->nb[2],
+    };
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(w),   1);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(x),   2);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(ids), 3);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(wts), 4);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(dst), 5);
+
+    const int nrptg = 1*4; // MMID_GLU_NR0 * MMID_GLU_NSG
+
+    ggml_metal_encoder_dispatch_threadgroups(enc, ((int) w->ne[1] + nrptg - 1)/nrptg, 1, 1, 32, 4, 1);
+
+    return 1 + n_used; // mmid + mul + (n_used-1) adds, filtered
+}
+
 int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
+    if (ctx->use_fusion) {
+        int n_fuse = ggml_metal_op_mul_mv_id_glu(ctx, idx);
+        if (n_fuse > 0) {
+            return n_fuse;
+        }
+        n_fuse = ggml_metal_op_mul_mv_id_reduce(ctx, idx);
+        if (n_fuse > 0) {
+            return n_fuse;
+        }
+    }
+
     ggml_tensor * op = ctx->node(idx);
 
     ggml_metal_library_t lib = ctx->lib;

@@ -1979,6 +1979,44 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_topk_moe(ggml_me
     return res;
 }
 
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id_glu(ggml_metal_library_t lib, ggml_type type, ggml_glu_op glu_op) {
+    GGML_ASSERT(type == GGML_TYPE_Q4_K);
+    GGML_ASSERT(glu_op == GGML_GLU_OP_SWIGLU);
+    GGML_UNUSED(type);
+    GGML_UNUSED(glu_op);
+
+    char base[256];
+    char name[256];
+
+    snprintf(base, 256, "kernel_mul_mv_id_q4_K_swiglu_f32");
+    snprintf(name, 256, "%s", base);
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, base, name, nullptr);
+    }
+
+    return res;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id_reduce(ggml_metal_library_t lib, ggml_type type) {
+    GGML_ASSERT(type == GGML_TYPE_Q5_1);
+    GGML_UNUSED(type);
+
+    char base[256];
+    char name[256];
+
+    snprintf(base, 256, "kernel_mul_mv_id_q5_1_reduce_f32");
+    snprintf(name, 256, "%s", base);
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, base, name, nullptr);
+    }
+
+    return res;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_conv_transpose_2d(ggml_metal_library_t lib, const ggml_tensor * op) {
     assert(op->op == GGML_OP_CONV_TRANSPOSE_2D);
 

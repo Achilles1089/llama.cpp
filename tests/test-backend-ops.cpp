@@ -4743,6 +4743,75 @@ struct test_mul_mat_id : public test_case {
     }
 };
 
+// MoE decode aggregation tail as emitted by build_moe_ffn:
+//   experts = mul_mat_id(down_exps, act, ids); experts = mul(experts, weights);
+//   out = sum over per-slot views (add chain)
+struct test_moe_down_reduce : public test_case {
+    const ggml_type type_a;
+    const int n_mats;
+    const int n_used;
+    const int64_t m; // output rows (n_embd)
+    const int64_t k; // expert FFN width
+
+    std::string vars() override {
+        return VARS_TO_STR5(type_a, n_mats, n_used, m, k);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MOE_DOWN_REDUCE";
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    test_moe_down_reduce(ggml_type type_a = GGML_TYPE_Q5_1,
+            int n_mats = 16, int n_used = 4, int64_t m = 64, int64_t k = 32)
+        : type_a(type_a), n_mats(n_mats), n_used(n_used), m(m), k(k) {
+            GGML_ASSERT(n_used <= n_mats);
+        }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * as = ggml_new_tensor_3d(ctx, type_a, k, m, n_mats);
+        ggml_set_name(as, "as");
+
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, 1);
+        ggml_set_name(ids, "ids");
+        if (n_used != n_mats) {
+            ids = ggml_view_2d(ctx, ids, n_used, 1, ids->nb[1], 0);
+        }
+
+        ggml_tensor * act = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, n_used, 1);
+        ggml_set_name(act, "act");
+
+        ggml_tensor * wts = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, n_used, 1);
+        ggml_set_name(wts, "wts");
+
+        ggml_tensor * experts = ggml_mul_mat_id(ctx, as, act, ids); // [m, n_used, 1]
+        experts = ggml_mul(ctx, experts, wts);
+
+        ggml_tensor * cur_experts[16];
+        for (int i = 0; i < n_used; ++i) {
+            cur_experts[i] = ggml_view_2d(ctx, experts, m, 1, experts->nb[2], i*experts->nb[1]);
+        }
+
+        ggml_tensor * moe_out = cur_experts[0];
+        for (int i = 1; i < n_used; ++i) {
+            moe_out = ggml_add(ctx, moe_out, cur_experts[i]);
+        }
+
+        ggml_set_name(moe_out, "moe_out");
+        return moe_out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        init_mul_mat_id_tensors(ctx, n_mats);
+    }
+};
+
 // GGML_OP_MUL_MAT_ID + GGML_OP_ADD or GGML_OP_MUL
 struct test_mul_mat_id_fusion : public test_case {
     const ggml_type type_a;
@@ -10039,6 +10108,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // Metal fused down + route-weights + expert reduce at MoE decode shapes:
+    // the exact build_moe_ffn aggregation tail (mmid -> mul -> views -> add chain)
+    test_cases.emplace_back(new test_moe_down_reduce(GGML_TYPE_Q5_1, 512, 10, 2560, 640));
+    test_cases.emplace_back(new test_moe_down_reduce(GGML_TYPE_Q5_1, 32, 4, 128, 64));
+    test_cases.emplace_back(new test_moe_down_reduce(GGML_TYPE_Q5_1, 16, 2, 96, 32));
+
+    // Metal fused mul_mv_id + swiglu at MoE decode shapes (Qwen3.8-Flash-Next:
+    // 512 experts, top-10, 2560 -> 640, broadcast activations, one token)
+    test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q4_K, GGML_GLU_OP_SWIGLU, 1, 640, 2560,
+        true, 512, 10, true, false, true, false));
+    test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q4_K, GGML_GLU_OP_SWIGLU, 1, 64, 512,
+        true, 32, 4, true, false, true, false));
+    test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q4_K, GGML_GLU_OP_SWIGLU, 1, 40, 256,
+        true, 16, 5, true, false, true, false));
+
     for (auto gate : {GATING_FUNC_SOFTMAX, GATING_FUNC_SIGMOID, GATING_FUNC_SOFTMAX_WEIGHT, GATING_FUNC_SQRT_SOFTPLUS}) {
         for (bool with_norm : {false, true}) {
             for (bool bias_probs : {false, true}) {
@@ -10141,6 +10225,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    // Qwen3.8-Flash-Next decode-shape MoE spine (512 experts, top-10, 2560<->640):
+    // up/gate mul_mv_id, down mul_mv_id, and the small glue around them
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 512, 10, true,  640, 1, 2560)); // up or gate
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q5_1, GGML_TYPE_F32, 512, 10, false, 2560, 1, 640)); // down
+    test_cases.emplace_back(new test_glu_split(GGML_GLU_OP_SWIGLU, GGML_TYPE_F32, { 640, 10, 1, 1 }, 0));      // swiglu_split glue
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 512, 1, 2560, {1, 1}, {1, 1}));    // router
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 640, 1, 2560, {1, 1}, {1, 1}));    // shexp up/gate
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 2560, 1, 640, {1, 1}, {1, 1}));    // shexp down
 
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
     // note: same bytes either way, so a backend that indexes them differently shows it here
