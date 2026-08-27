@@ -1331,7 +1331,13 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                     }
                     // check if the split has too many inputs
                     // FIXME: count the number of inputs instead of only checking when full
-                    if (split->n_inputs >= split->inputs_capacity) {
+                    // default here: let the split GROW its inputs (the append path reallocs)
+                    // instead of fracturing the graph into more submissions — ~66 tiny host-side
+                    // inputs (PLE rows, QSA index inputs) were splitting qwen4exp decode into 4
+                    // Metal command chains with ~0.65ms host gaps between them.
+                    // GGML_SCHED_LEGACY_SPLIT_CAP=1 restores the fracture-at-capacity behavior.
+                    static const bool legacy_split_cap = getenv("GGML_SCHED_LEGACY_SPLIT_CAP") != nullptr;
+                    if (legacy_split_cap && split->n_inputs >= split->inputs_capacity) {
                         const size_t id = hash_id(src);
                         int src_backend_id = sched->hv_tensor_backend_ids[id];
                         bool supported = ggml_backend_sched_buffer_supported(sched, src, cur_backend_id);
