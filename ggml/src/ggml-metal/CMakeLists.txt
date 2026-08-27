@@ -48,6 +48,7 @@ set(METALLIB_KERNEL_SOURCES
     kernels/conv.metal
     kernels/upscale.metal
     kernels/argsort.metal
+    kernels/topk_moe.metal
     kernels/pool.metal
     kernels/misc.metal
 )

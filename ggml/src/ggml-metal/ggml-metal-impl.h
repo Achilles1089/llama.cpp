@@ -650,6 +650,17 @@ typedef struct {
 } ggml_metal_kargs_snake;
 
 typedef struct {
+    uint64_t nb01;          // logits row stride (bytes)
+    uint64_t nbi1;          // ids row stride (argsort-shaped: n_experts * 4)
+    uint64_t nbw1;          // weights row stride
+    int32_t  n_rows;
+    int32_t  n_expert_used;
+    int32_t  with_norm;
+    float    clamp_min;
+    float    scale;
+} ggml_metal_kargs_topk_moe;
+
+typedef struct {
     int32_t  IC;
     int32_t  IH;
     int32_t  IW;

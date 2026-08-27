@@ -89,6 +89,17 @@ struct ggml_metal_op {
         return ggml_can_fuse_ext(gf, idxs.data() + i0, ops, n_ops);
     }
 
+    // raw-graph access for pattern matchers that span empty (view/reshape)
+    // nodes, which the idxs filter hides
+    int idx_raw(int i) const {
+        assert(i >= 0 && i < (int) idxs.size());
+        return idxs[i];
+    }
+
+    const ggml_cgraph * graph() const {
+        return gf;
+    }
+
     ggml_metal_device_t  dev;
     ggml_metal_library_t lib;
     ggml_metal_encoder_t enc;
@@ -1509,7 +1520,173 @@ int ggml_metal_op_dsv4_hc(ggml_metal_op_t ctx, int idx) {
     return 1;
 }
 
+// Fused MoE routing (softmax gating, norm_topk_prob path — qwen4exp et al):
+// matches the 10-node raw span SOFT_MAX -> RESHAPE -> ARGSORT -> VIEW ->
+// GET_ROWS -> RESHAPE -> SUM_ROWS -> CLAMP -> DIV -> RESHAPE emitted by
+// build_moe_ffn and replaces its 6 real dispatches (incl. the 512-thread
+// bitonic argsort) with one simdgroup-argmax kernel. Port of the CUDA
+// topk-moe fusion (ggml-cuda/topk-moe.cu). Returns 6 (filtered nodes
+// consumed) on fusion, 0 to fall through to the unfused path.
+int ggml_metal_op_topk_moe(ggml_metal_op_t ctx, int idx) {
+    static const bool disabled = getenv("GGML_METAL_TOPK_MOE_DISABLE") != nullptr;
+    if (disabled) {
+        return 0;
+    }
+
+    const ggml_cgraph * gf = ctx->graph();
+
+    const int i0 = ctx->idx_raw(idx);
+
+    static constexpr ggml_op TOPK_MOE_OPS[10] = {
+        GGML_OP_SOFT_MAX, GGML_OP_RESHAPE, GGML_OP_ARGSORT, GGML_OP_VIEW, GGML_OP_GET_ROWS,
+        GGML_OP_RESHAPE, GGML_OP_SUM_ROWS, GGML_OP_CLAMP, GGML_OP_DIV, GGML_OP_RESHAPE,
+    };
+
+    if (i0 + 10 > gf->n_nodes) {
+        return 0;
+    }
+    for (int k = 0; k < 10; ++k) {
+        if (gf->nodes[i0 + k]->op != TOPK_MOE_OPS[k]) {
+            return 0;
+        }
+    }
+
+    // the filtered window must map exactly onto the raw span: 6 non-empty ops
+    // ending at the DIV (a foreign interleaved node would break this)
+    if (idx + 5 >= ctx->n_nodes() || ctx->node(idx + 5) != gf->nodes[i0 + 8]) {
+        return 0;
+    }
+
+    const int outs[2] = { i0 + 3, i0 + 9 };
+    if (!ggml_can_fuse_subgraph(gf, i0, 10, TOPK_MOE_OPS, outs, 2)) {
+        return 0;
+    }
+
+    ggml_tensor * smax    = gf->nodes[i0 + 0];
+    ggml_tensor * probs_r = gf->nodes[i0 + 1];
+    ggml_tensor * argsrt  = gf->nodes[i0 + 2];
+    ggml_tensor * ids     = gf->nodes[i0 + 3];
+    ggml_tensor * grows   = gf->nodes[i0 + 4];
+    ggml_tensor * w_2d    = gf->nodes[i0 + 5];
+    ggml_tensor * sums    = gf->nodes[i0 + 6];
+    ggml_tensor * clampn  = gf->nodes[i0 + 7];
+    ggml_tensor * divn    = gf->nodes[i0 + 8];
+
+    ggml_tensor * logits = smax->src[0];
+
+    // src wiring: closure is proven by can_fuse_subgraph, this pins the DAG
+    // shape build_moe_ffn emits (argsort ranks the raw probs, get_rows gathers
+    // from the [1, n_expert, T] reshape, div renormalizes by the clamped sum)
+    if (probs_r->src[0] != smax  || argsrt->src[0]  != smax  ||
+        ids->src[0]     != argsrt || grows->src[0]  != probs_r ||
+        grows->src[1]   != ids    || w_2d->src[0]   != grows ||
+        sums->src[0]    != w_2d   || clampn->src[0] != sums  ||
+        divn->src[0]    != w_2d   || divn->src[1]   != clampn ||
+        gf->nodes[i0 + 9]->src[0] != divn) {
+        return 0;
+    }
+
+    // plain softmax only: no mask, no sinks, scale 1, no ALiBi
+    float sm_scale;
+    float sm_bias;
+    memcpy(&sm_scale, (const float *) smax->op_params + 0, sizeof(float));
+    memcpy(&sm_bias,  (const float *) smax->op_params + 1, sizeof(float));
+
+    if (smax->src[1] || smax->src[2] || sm_scale != 1.0f || sm_bias != 0.0f) {
+        return 0;
+    }
+    if (logits->type != GGML_TYPE_F32 || !ggml_is_contiguous(logits)) {
+        return 0;
+    }
+    if (smax->ne[2] != 1 || smax->ne[3] != 1) {
+        return 0;
+    }
+
+    const int n_expert = (int) logits->ne[0];
+    if (n_expert != 32 && n_expert != 64 && n_expert != 128 && n_expert != 256 && n_expert != 512) {
+        return 0;
+    }
+
+    // ids is the first-k view of the argsort output: i32, full-row stride
+    if (ids->type != GGML_TYPE_I32 || (int) (ids->nb[1]/ids->nb[0]) != n_expert) {
+        return 0;
+    }
+
+    const int n_expert_used = (int) ids->ne[0];
+    if (n_expert_used <= 0 || n_expert_used > 16 || n_expert_used > n_expert) {
+        return 0;
+    }
+
+    if (divn->type != GGML_TYPE_F32 || divn->nb[0] != sizeof(float) || (int) divn->ne[0] != n_expert_used) {
+        return 0;
+    }
+
+    const int n_rows = (int) logits->ne[1];
+
+    // multi-row alias hazard (CUDA check, single-row exemption): with T > 1 a
+    // row's output write could land in logits another simdgroup has not read
+    if (n_rows > 1) {
+        const ggml_metal_buffer_id bl = ggml_metal_get_buffer_id(logits);
+        const ggml_metal_buffer_id bi = ggml_metal_get_buffer_id(argsrt);
+        const ggml_metal_buffer_id bw = ggml_metal_get_buffer_id(divn);
+
+        const size_t l0 = bl.offs;
+        const size_t l1 = bl.offs + ggml_nbytes(logits);
+
+        if ((bi.metal == bl.metal && bi.offs < l1 && bi.offs + 2*ggml_nbytes(argsrt) > l0) ||
+            (bw.metal == bl.metal && bw.offs < l1 && bw.offs +   ggml_nbytes(divn)   > l0)) {
+            return 0;
+        }
+    }
+
+    // clamp(x, min, INF): op_params[0] = min
+    float clamp_min;
+    memcpy(&clamp_min, (const float *) clampn->op_params + 0, sizeof(float));
+
+    // interior fused nodes: same concurrency discipline as the snake fusion
+    for (int k = 1; k <= 5; ++k) {
+        if (!ggml_metal_op_concurrency_check(ctx, ctx->node(idx + k))) {
+            ggml_metal_op_concurrency_reset(ctx);
+
+            break;
+        }
+    }
+
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    auto pipeline = ggml_metal_library_get_pipeline_topk_moe(ctx->lib, n_expert);
+
+    ggml_metal_kargs_topk_moe args = {
+        /*.nb01          =*/ logits->nb[1],
+        /*.nbi1          =*/ ids->nb[1],
+        /*.nbw1          =*/ divn->nb[1],
+        /*.n_rows        =*/ n_rows,
+        /*.n_expert_used =*/ n_expert_used,
+        /*.with_norm     =*/ 1,
+        /*.clamp_min     =*/ clamp_min,
+        /*.scale         =*/ 1.0f,
+    };
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(logits), 1);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(ids),    2);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(divn),   3);
+
+    const int ntg = (n_rows + 3)/4; // TOPK_MOE_NSG rows per threadgroup
+    ggml_metal_encoder_dispatch_threadgroups(enc, ntg, 1, 1, 128, 1, 1);
+
+    return 6;
+}
+
 int ggml_metal_op_soft_max(ggml_metal_op_t ctx, int idx) {
+    if (ctx->use_fusion) {
+        const int n_fuse = ggml_metal_op_topk_moe(ctx, idx);
+        if (n_fuse > 0) {
+            return n_fuse;
+        }
+    }
+
     ggml_tensor * op = ctx->node(idx);
 
     ggml_metal_library_t lib = ctx->lib;

@@ -123,6 +123,7 @@ int ggml_metal_pipeline_max_theads_per_threadgroup(struct ggml_metal_pipeline_wi
     X(CONV,            conv)           \
     X(UPSCALE,         upscale)        \
     X(ARGSORT,         argsort)        \
+    X(TOPK_MOE,        topk_moe)       \
     X(POOL,            pool)           \
     X(MISC,            misc)
 

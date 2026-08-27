@@ -391,6 +391,35 @@ void ggml_graph_optimize(ggml_cgraph * gf) {
             /*.fused =*/ {},
         };
 
+        // topk-moe: pack the 10-node routing span (SOFT_MAX .. RESHAPE) so the
+        // concurrency reorder cannot interleave foreign nodes into it — the
+        // Metal encoder fuses it into one kernel (ggml_metal_op_topk_moe)
+        if (node.op() == GGML_OP_SOFT_MAX && i + 10 <= n) {
+            static constexpr ggml_op topk_moe_ops[10] = {
+                GGML_OP_SOFT_MAX, GGML_OP_RESHAPE, GGML_OP_ARGSORT, GGML_OP_VIEW, GGML_OP_GET_ROWS,
+                GGML_OP_RESHAPE, GGML_OP_SUM_ROWS, GGML_OP_CLAMP, GGML_OP_DIV, GGML_OP_RESHAPE,
+            };
+
+            bool match = true;
+            for (int k = 0; k < 10; ++k) {
+                if (gf->nodes[i + k]->op != topk_moe_ops[k]) {
+                    match = false;
+                    break;
+                }
+            }
+
+            const int outs[2] = { i + 3, i + 9 };
+            if (match && ggml_can_fuse_subgraph(gf, i, 10, topk_moe_ops, outs, 2)) {
+                for (int k = 1; k < 10; ++k) {
+                    ++i;
+                    node.add_fused(gf->nodes[i]);
+                }
+
+                nodes.push_back(std::move(node));
+                continue;
+            }
+        }
+
         // fuse only ops that start with these operations
         // can be expanded when needed
         if (node.op() == GGML_OP_ADD ||
