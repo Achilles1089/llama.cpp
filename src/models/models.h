@@ -2191,7 +2191,10 @@ struct llama_model_qwen3next : public llama_model_base {
 
     struct graph : public llm_build_delta_net_base {
         graph(const llama_model & model, const llm_graph_params & params);
-    private:
+        // init-only: graph_mtp chains here and builds its own graph
+        graph(const llama_model & model, const llm_graph_params & params, bool /*mtp*/)
+            : llm_build_delta_net_base(params), model(model) {}
+    protected:
         ggml_tensor * build_layer_attn(
         llm_graph_input_attn_kv * inp_attn,
                     ggml_tensor * cur,
@@ -2236,7 +2239,10 @@ struct llama_model_qwen35 : public llama_model_base {
 
     struct graph : public llm_build_delta_net_base {
         graph(const llama_model & model, const llm_graph_params & params);
-    private:
+        // init-only: graph_mtp chains here and builds its own graph
+        graph(const llama_model & model, const llm_graph_params & params, bool /*mtp*/)
+            : llm_build_delta_net_base(params), model(model) {}
+    protected:
         ggml_tensor * build_layer_attn(
         llm_graph_input_attn_kv * inp_attn,
                     ggml_tensor * cur,
@@ -2283,7 +2289,10 @@ struct llama_model_qwen4exp : public llama_model_base {
 
     struct graph : public llm_build_delta_net_base {
         graph(const llama_model & model, const llm_graph_params & params);
-    private:
+        // init-only: graph_mtp chains here and builds its own graph
+        graph(const llama_model & model, const llm_graph_params & params, bool /*mtp*/)
+            : llm_build_delta_net_base(params), model(model) {}
+    protected:
         // HC replaces every layer norm: residual is [n_embd, hc, n_tokens]
         ggml_tensor * build_hc_mix(
                     ggml_tensor * x,
@@ -2368,6 +2377,11 @@ struct llama_model_qwen4exp : public llama_model_base {
         const llama_model & model;
     };
 
+    // the MTP draft head: eh_proj input fusion + one dense-attending layer + its own mixer
+    struct graph_mtp : public graph {
+        graph_mtp(const llama_model & model, const llm_graph_params & params);
+    };
+
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
 };
 
@@ -2378,7 +2392,10 @@ struct llama_model_qwen35moe : public llama_model_base {
 
     struct graph : public llm_build_delta_net_base {
         graph(const llama_model & model, const llm_graph_params & params);
-    private:
+        // init-only: graph_mtp chains here and builds its own graph
+        graph(const llama_model & model, const llm_graph_params & params, bool /*mtp*/)
+            : llm_build_delta_net_base(params), model(model) {}
+    protected:
         ggml_tensor * build_layer_attn(
         llm_graph_input_attn_kv * inp_attn,
                     ggml_tensor * cur,
@@ -2513,6 +2530,11 @@ struct llama_model_kimi_linear : public llama_model_base {
                             int   il);
 
         const llama_model & model;
+    };
+
+    // the MTP draft head: eh_proj input fusion + one dense-attending layer + its own mixer
+    struct graph_mtp : public graph {
+        graph_mtp(const llama_model & model, const llm_graph_params & params);
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
