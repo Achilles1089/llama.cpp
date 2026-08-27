@@ -999,7 +999,10 @@ public:
 
     bool can_reuse(const llm_graph_params & params) override {
         // the hash rows are refreshed by set_input each ubatch; the topology only
-        // depends on the row count
+        // depends on the row count. The KV context is a per-decode object, so it
+        // must be rebound before set_input walks it for the predecessor tokens.
+        this->mctx = static_cast<const llama_memory_hybrid_idx_context *>(params.mctx)->get_attn();
+
         return rows->ne[0] == (int64_t) pmodel.hparams.ple_n_heads * params.ubatch.n_tokens;
     }
 
