@@ -367,6 +367,32 @@ private:
     llm_graph_result_ptr gf_res_prev;
     llm_graph_result_ptr gf_res_reserve;
 
+    // per-shape graph slots: speculative decode alternates batch shapes
+    // (draft-1 / catch-up / verify), which thrashes the single cached graph and
+    // forces a rebuild nearly every step. Aux slots keep one shape's graph warm
+    // each. Every slot owns its own scheduler — cached graphs cannot share an
+    // allocation arena (alloc_graph for one invalidates the other's tensors).
+    // Slot 0 is the primary (sched + gf_res_prev above); LLAMA_GRAPH_SLOTS caps
+    // the total (default 4, 1 = legacy single-slot behavior).
+    struct graph_slot_aux {
+        ggml_backend_sched_ptr sched;
+        llm_graph_result_ptr   res;
+        uint64_t               used = 0;
+    };
+    std::vector<graph_slot_aux> gslots_aux;
+    uint32_t gslots_max          = 4;
+    uint64_t gslots_clock        = 0;
+    uint64_t gslots_used_primary = 0;
+    size_t   sched_max_nodes     = 0;
+
+    // the scheduler owning the most recently built/reused graph — tensor-backend
+    // lookups for the current graph's outputs must go through this one
+    ggml_backend_sched_t sched_active = nullptr;
+
+    ggml_backend_sched_t sched_cur() const {
+        return sched_active ? sched_active : sched.get();
+    }
+
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;
 
