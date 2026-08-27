@@ -405,6 +405,7 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
         }
         cb(flat, "h_nextn", -1);
         res->t_h_nextn = flat;
+        ggml_build_forward_expand(gf, flat);
     }
 
     // the final mixer is the output norm: there is no separate one
@@ -1328,6 +1329,7 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
         res_hc = ggml_reshape_3d(ctx0, flat, n_embd, hc, n_outputs);
     }
     res->t_h_nextn = flat; // draft ctx runs masked=true; feeds self-chaining
+    ggml_build_forward_expand(gf, flat);
 
     // the MTP's own mixer without an inject gate doubles as the final norm
     cur = build_hc_mix(res_hc, layer.nextn.hc_norm, layer.nextn.hc_down, layer.nextn.hc_up,
