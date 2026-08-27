@@ -1083,6 +1083,8 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "DSV4_HC_COMB",
     "DSV4_HC_PRE",
     "DSV4_HC_POST",
+    "HC_MIX",
+    "HC_COMBINE",
 
     "UNARY",
 
@@ -1100,7 +1102,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1198,6 +1200,8 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "dsv4_hc_comb(mixes, scale, base)",
     "dsv4_hc_pre(x, weights)",
     "dsv4_hc_post(x, residual, post, comb)",
+    "hc_mix(x, gamma, down, up)",
+    "hc_combine(residual, block_out, inject)",
 
     "unary(x)",
 
@@ -1215,7 +1219,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6458,6 +6462,86 @@ struct ggml_tensor * ggml_dsv4_hc_pre(
     result->op     = GGML_OP_DSV4_HC_PRE;
     result->src[0] = x;
     result->src[1] = weights;
+
+    return result;
+}
+
+// ggml_hc_mix
+
+struct ggml_tensor * ggml_hc_mix(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * gamma,
+        struct ggml_tensor  * down,
+        struct ggml_tensor  * up,
+        struct ggml_tensor  * inject_w,
+        float                 eps) {
+    GGML_ASSERT(x->type     == GGML_TYPE_F32);
+    GGML_ASSERT(gamma->type == GGML_TYPE_F32);
+    GGML_ASSERT(down->type  == GGML_TYPE_F32 || down->type == GGML_TYPE_Q8_0);
+    GGML_ASSERT(up->type    == down->type);
+    GGML_ASSERT(ggml_is_contiguous(x));
+
+    const int64_t n_embd   = x->ne[0];
+    const int64_t hc       = x->ne[1];
+    const int64_t n_tokens = x->ne[2];
+    const int64_t hc_dim   = n_embd*hc;
+    const int64_t lr       = down->ne[1];
+
+    GGML_ASSERT(hc > 0 && x->ne[3] == 1);
+    GGML_ASSERT(gamma->ne[0] == hc_dim);
+    GGML_ASSERT(down->ne[0]  == hc_dim && down->ne[1] == lr);
+    GGML_ASSERT(up->ne[0]    == lr     && up->ne[1]   == hc_dim);
+    if (inject_w) {
+        GGML_ASSERT(inject_w->type == GGML_TYPE_F32);
+        GGML_ASSERT(inject_w->ne[0] == hc_dim && inject_w->ne[1] == hc);
+    }
+
+    // flat blocks: mixed [n_embd, n_tokens], inject [hc, n_tokens], then the
+    // low-rank bottleneck lo [lr, n_tokens] as inter-stage scratch — the first
+    // two carve out as contiguous views, lo is an implementation detail
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32,
+            (n_embd + (inject_w ? hc : 0) + lr)*n_tokens);
+
+    ggml_set_op_params_f32(result, 0, eps);
+
+    result->op     = GGML_OP_HC_MIX;
+    result->src[0] = x;
+    result->src[1] = gamma;
+    result->src[2] = down;
+    result->src[3] = up;
+    result->src[4] = inject_w;
+
+    return result;
+}
+
+// ggml_hc_combine
+
+struct ggml_tensor * ggml_hc_combine(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * residual,
+        struct ggml_tensor  * block_out,
+        struct ggml_tensor  * inject) {
+    GGML_ASSERT(residual->type  == GGML_TYPE_F32);
+    GGML_ASSERT(block_out->type == GGML_TYPE_F32);
+    GGML_ASSERT(inject->type    == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(residual));
+    GGML_ASSERT(ggml_is_contiguous(block_out));
+    GGML_ASSERT(inject->nb[0] == sizeof(float)); // row-strided views are fine
+
+    const int64_t n_embd   = residual->ne[0];
+    const int64_t hc       = residual->ne[1];
+    const int64_t n_tokens = residual->ne[2];
+
+    GGML_ASSERT(block_out->ne[0] == n_embd && block_out->ne[1] == n_tokens);
+    GGML_ASSERT(inject->ne[0]    == hc     && inject->ne[1]    == n_tokens);
+
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_tokens);
+
+    result->op     = GGML_OP_HC_COMBINE;
+    result->src[0] = residual;
+    result->src[1] = block_out;
+    result->src[2] = inject;
 
     return result;
 }

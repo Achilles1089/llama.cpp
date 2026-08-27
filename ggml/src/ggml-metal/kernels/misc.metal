@@ -593,3 +593,174 @@ kernel void kernel_dsv4_hc_post_f32(
         *(device float *) (dst + i0*args.nb_d0 + idst*args.nb_d1 + it*args.nb_d2) = result[idst];
     }
 }
+
+
+// qwen4exp low-rank hyper-connection mix — two WIDE stages (a single
+// threadgroup per token starved 63 of 64 GPU cores; measured 12x slower).
+// Both stages recompute the per-stream rms factors locally (4 cheap
+// reductions) so every threadgroup is independent. Stage 1 fills the lo
+// scratch block of dst; stage 2 consumes it for the gate + mean collapse.
+// dst layout: [mixed n_embd*nt | inject hc*nt | lo lr*nt], all contiguous.
+
+static inline float hc_mix_rr(device const float * xs, int n_embd, float eps, ushort lane) {
+    float acc = 0.0f;
+    for (int i = lane; i < n_embd; i += 32) {
+        acc += xs[i]*xs[i];
+    }
+    acc = simd_sum(acc);
+    return rsqrt(acc/n_embd + eps);
+}
+
+// one simdgroup per lo row; lanes stride whole q8 blocks' elements coalesced
+#define HC_MIX_NSG 8
+kernel void kernel_hc_mix_stage1_f32(
+        constant ggml_metal_kargs_hc_mix & args,
+        device const char * xsrc,
+        device const char * gsrc,
+        device const char * wsrc,
+        device       char * dst,
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    const int t      = tgpig.y;
+    const int n_embd = args.n_embd;
+    const int hc     = args.hc;
+    const int lr     = args.lr;
+    const int hc_dim = n_embd*hc;
+    const int k      = tgpig.x*HC_MIX_NSG + sgitg; // lo row
+
+    device const float * x  = (device const float *) (xsrc + (int64_t)t*args.nb_x2);
+    device const float * gm = (device const float *) gsrc;
+    device       float * lo = (device float *) dst
+        + (int64_t)args.n_tokens*(n_embd + (args.has_inject ? hc : 0)) + (int64_t)t*lr;
+
+    // per-stream rms factors, recomputed locally
+    float rr[8];
+    for (int h = 0; h < hc; ++h) {
+        rr[h] = hc_mix_rr(x + h*n_embd, n_embd, args.eps, tiisg);
+    }
+
+    if (k >= lr) {
+        return;
+    }
+
+    float acc = 0.0f;
+    if (args.wq8) {
+        device const char * wr = wsrc + (int64_t)k*args.nb_w1;
+        for (int b = 0; b < hc_dim/32; ++b) {
+            device const half * d  = (device const half *) (wr + b*34);
+            device const char * qs = wr + b*34 + 2;
+            const int j = b*32 + tiisg;
+            acc += (float) d[0] * (float) qs[tiisg] * (x[j]*rr[j/n_embd]*gm[j]);
+        }
+    } else {
+        device const float * wr = (device const float *) (wsrc + (int64_t)k*args.nb_w1);
+        for (int j = tiisg; j < hc_dim; j += 32) {
+            acc += wr[j]*(x[j]*rr[j/n_embd]*gm[j]);
+        }
+    }
+    acc = simd_sum(acc);
+    if (tiisg == 0) {
+        const float v = acc/(float) hc;
+        lo[k] = v/(1.0f + exp(-v));
+    }
+}
+
+// one simdgroup per output element; the up-row 320-dot splits across lanes
+kernel void kernel_hc_mix_stage2_f32(
+        constant ggml_metal_kargs_hc_mix & args,
+        device const char * xsrc,
+        device const char * gsrc,
+        device const char * usrc,
+        device const char * isrc,
+        device       char * dst,
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    const int t      = tgpig.y;
+    const int n_embd = args.n_embd;
+    const int hc     = args.hc;
+    const int lr     = args.lr;
+    const int i      = tgpig.x*HC_MIX_NSG + sgitg; // output element
+
+    device const float * x  = (device const float *) (xsrc + (int64_t)t*args.nb_x2);
+    device const float * gm = (device const float *) gsrc;
+    device const float * lo = (device const float *) dst
+        + (int64_t)args.n_tokens*(n_embd + (args.has_inject ? hc : 0)) + (int64_t)t*lr;
+    device       float * out     = (device float *) dst + (int64_t)t*n_embd;
+    device       float * out_inj = (device float *) dst + (int64_t)args.n_tokens*n_embd + (int64_t)t*hc;
+
+    float rr[8];
+    for (int h = 0; h < hc; ++h) {
+        rr[h] = hc_mix_rr(x + h*n_embd, n_embd, args.eps, tiisg);
+    }
+
+    if (i < n_embd) {
+        float acc_i = 0.0f;
+        for (int h = 0; h < hc; ++h) {
+            const int j = h*n_embd + i;
+            float acc = 0.0f;
+            if (args.wq8) {
+                device const char * ur = usrc + (int64_t)j*args.nb_u1;
+                for (int b = 0; b < lr/32; ++b) {
+                    device const half * d  = (device const half *) (ur + b*34);
+                    device const char * qs = ur + b*34 + 2;
+                    acc += (float) d[0] * (float) qs[tiisg] * lo[b*32 + tiisg];
+                }
+            } else {
+                device const float * ur = (device const float *) (usrc + (int64_t)j*args.nb_u1);
+                for (int q = tiisg; q < lr; q += 32) {
+                    acc += ur[q]*lo[q];
+                }
+            }
+            acc = simd_sum(acc);
+            const float g = 1.0f/(1.0f + exp(-acc));
+            acc_i += (x[j]*rr[h]*gm[j])*g;
+        }
+        if (tiisg == 0) {
+            out[i] = acc_i/(float) hc;
+        }
+    }
+
+    // inject rows ride the first threadgroup
+    if (args.has_inject && tgpig.x == 0 && sgitg < hc) {
+        const int h = sgitg;
+        device const float * ir = (device const float *) (isrc + (int64_t)h*args.nb_i1);
+        float acc = 0.0f;
+        for (int j = tiisg; j < n_embd*hc; j += 32) {
+            acc += ir[j]*(x[j]*rr[j/n_embd]*gm[j]);
+        }
+        acc = simd_sum(acc);
+        if (tiisg == 0) {
+            out_inj[h] = acc;
+        }
+    }
+}
+
+// qwen4exp hyper-connection scatter-back:
+//   out[i, h, t] = residual[i, h, t] + block_out[i, t]*2*sigmoid(inject[h, t]/hc)
+kernel void kernel_hc_combine_f32(
+        constant ggml_metal_kargs_hc_combine & args,
+        device const char * rsrc,
+        device const char * bsrc,
+        device const char * isrc,
+        device       char * dst,
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        uint3 tpitg[[thread_position_in_threadgroup]],
+        uint3   ntg[[threads_per_threadgroup]]) {
+    const int t = tgpig.y;
+    const int n = args.n_embd*args.hc;
+
+    device const float * r  = (device const float *) (rsrc + (int64_t)t*args.nb_r2);
+    device const float * b  = (device const float *) (bsrc + (int64_t)t*args.nb_b1);
+    device const float * iv = (device const float *) (isrc + (int64_t)t*args.nb_i1);
+    device       float * o  = (device       float *) (dst  + (int64_t)t*args.nb_d2);
+
+    const int j = tgpig.x*ntg.x + tpitg.x;
+    if (j < n) {
+        const int h = j/args.n_embd;
+        const int i = j - h*args.n_embd;
+        const float w = 2.0f/(1.0f + exp(-iv[h]/(float) args.hc));
+        o[j] = r[j] + b[i]*w;
+    }
+}

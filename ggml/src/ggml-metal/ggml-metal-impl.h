@@ -1280,6 +1280,31 @@ typedef struct {
 
 typedef struct {
     int32_t  n_embd;
+    int32_t  hc;
+    int32_t  lr;
+    int32_t  n_tokens;
+    int32_t  has_inject;
+    int32_t  wq8;           // 1 if down/up are Q8_0, 0 if F32
+    float    eps;
+    uint64_t nb_x2;         // x token stride
+    uint64_t nb_w1;         // down row stride
+    uint64_t nb_u1;         // up row stride
+    uint64_t nb_i1;         // inject_w row stride
+    uint64_t nb_d1;         // dst token stride
+} ggml_metal_kargs_hc_mix;
+
+typedef struct {
+    int32_t  n_embd;
+    int32_t  hc;
+    int32_t  n_tokens;
+    uint64_t nb_r2;         // residual token stride
+    uint64_t nb_b1;         // block_out token stride
+    uint64_t nb_i1;         // inject token stride
+    uint64_t nb_d2;         // dst token stride
+} ggml_metal_kargs_hc_combine;
+
+typedef struct {
+    int32_t  n_embd;
     int32_t  n_tokens;
     uint64_t nb_x0;
     uint64_t nb_x1;

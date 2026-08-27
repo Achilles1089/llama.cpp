@@ -4743,6 +4743,56 @@ struct test_mul_mat_id : public test_case {
     }
 };
 
+// qwen4exp fused hyper-connection ops
+struct test_hc_mix : public test_case {
+    const ggml_type wtype;
+    const int64_t n_embd, hc, lr, n_tokens;
+    const bool with_inject;
+
+    std::string vars() override {
+        return VARS_TO_STR6(wtype, n_embd, hc, lr, n_tokens, with_inject);
+    }
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "HC_MIX"; }
+    double max_nmse_err() override { return 5e-4; }
+
+    test_hc_mix(ggml_type wtype = GGML_TYPE_F32, int64_t n_embd = 64, int64_t hc = 4,
+                int64_t lr = 32, int64_t n_tokens = 1, bool with_inject = true)
+        : wtype(wtype), n_embd(n_embd), hc(hc), lr(lr), n_tokens(n_tokens), with_inject(with_inject) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x     = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_tokens);
+        ggml_tensor * gamma = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_embd*hc);
+        ggml_tensor * down  = ggml_new_tensor_2d(ctx, wtype, n_embd*hc, lr);
+        ggml_tensor * up    = ggml_new_tensor_2d(ctx, wtype, lr, n_embd*hc);
+        ggml_tensor * injw  = with_inject ? ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd*hc, hc) : nullptr;
+        ggml_tensor * out = ggml_hc_mix(ctx, x, gamma, down, up, injw, 1e-6f);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+struct test_hc_combine : public test_case {
+    const int64_t n_embd, hc, n_tokens;
+
+    std::string vars() override {
+        return VARS_TO_STR3(n_embd, hc, n_tokens);
+    }
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "HC_COMBINE"; }
+    double max_nmse_err() override { return 5e-4; }
+
+    test_hc_combine(int64_t n_embd = 64, int64_t hc = 4, int64_t n_tokens = 1)
+        : n_embd(n_embd), hc(hc), n_tokens(n_tokens) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * residual  = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_tokens);
+        ggml_tensor * block_out = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+        ggml_tensor * inject    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc, n_tokens);
+        ggml_tensor * out = ggml_hc_combine(ctx, residual, block_out, inject);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // MoE decode aggregation tail as emitted by build_moe_ffn:
 //   experts = mul_mat_id(down_exps, act, ids); experts = mul(experts, weights);
 //   out = sum over per-slot views (add chain)
@@ -10108,6 +10158,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+
+    // qwen4exp fused HC ops (decode + verify shapes; q8_0 = the model's weights)
+    for (ggml_type wt : {GGML_TYPE_F32, GGML_TYPE_Q8_0}) {
+        test_cases.emplace_back(new test_hc_mix(wt, 64, 4, 32, 1, true));
+        test_cases.emplace_back(new test_hc_mix(wt, 64, 4, 32, 3, false));
+        test_cases.emplace_back(new test_hc_mix(wt, 2560, 4, 320, 1, true));
+        test_cases.emplace_back(new test_hc_mix(wt, 2560, 4, 320, 3, true));
+    }
+    test_cases.emplace_back(new test_hc_combine(64, 4, 1));
+    test_cases.emplace_back(new test_hc_combine(2560, 4, 3));
 
     // Metal fused down + route-weights + expert reduce at MoE decode shapes:
     // the exact build_moe_ffn aggregation tail (mmid -> mul -> views -> add chain)

@@ -574,6 +574,8 @@ extern "C" {
         GGML_OP_DSV4_HC_COMB,
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
+        GGML_OP_HC_MIX,
+        GGML_OP_HC_COMBINE,
 
         GGML_OP_UNARY,
 
@@ -2625,6 +2627,29 @@ extern "C" {
     //                         + base[2*hc + dst + hc*src]
     // Softmax over dst, add eps, normalize over src, then repeat normalization
     // over dst followed by src for iterations 1 through n_iter - 1.
+    // qwen4exp low-rank hyper-connection mix, the whole chain in one op:
+    //   xn   = rms_norm_per_stream(x) * gamma                      x [n_embd, hc, n_tokens]
+    //   lo   = silu(down(xn) / hc)                                 down [hc*n_embd, lr]
+    //   gate = sigmoid(up(lo))                                     up   [lr, hc*n_embd]
+    //   mixed[i, t] = mean_h(xn[i, h, t] * gate[i + h*n_embd, t])  -> [n_embd, n_tokens]
+    // down/up may be F32 or Q8_0. eps in op_params[0].
+    GGML_API struct ggml_tensor * ggml_hc_mix(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * gamma,
+            struct ggml_tensor  * down,
+            struct ggml_tensor  * up,
+            struct ggml_tensor  * inject_w,
+            float                 eps);
+
+    // qwen4exp hyper-connection scatter-back:
+    //   out[i, h, t] = residual[i, h, t] + block_out[i, t] * 2*sigmoid(inject[h, t]/hc)
+    GGML_API struct ggml_tensor * ggml_hc_combine(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * residual,
+            struct ggml_tensor  * block_out,
+            struct ggml_tensor  * inject);
+
     GGML_API struct ggml_tensor * ggml_dsv4_hc_comb(
             struct ggml_context * ctx,
             struct ggml_tensor  * mixes,

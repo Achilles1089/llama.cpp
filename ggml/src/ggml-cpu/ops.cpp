@@ -11165,6 +11165,135 @@ void ggml_compute_forward_dsv4_hc_pre(
     }
 }
 
+// ggml_compute_forward_hc_mix
+// qwen4exp low-rank hyper-connection mix: rms-norm per stream, gamma, low-rank
+// silu/sigmoid gate, gated mean collapse, optional inject rows. Reference
+// implementation; token-parallel across threads.
+
+static float ggml_hc_mix_wrow_dot(const ggml_tensor * w, int64_t row, const float * v, int64_t n, float * scratch) {
+    const float * wr;
+    if (w->type == GGML_TYPE_F32) {
+        wr = (const float *) ((const char *) w->data + row*w->nb[1]);
+    } else {
+        ggml_get_type_traits(w->type)->to_float((const char *) w->data + row*w->nb[1], scratch, n);
+        wr = scratch;
+    }
+    float acc = 0.0f;
+    for (int64_t i = 0; i < n; ++i) {
+        acc += wr[i]*v[i];
+    }
+    return acc;
+}
+
+static void ggml_compute_forward_hc_mix_f32(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * x     = dst->src[0];
+    const ggml_tensor * gamma = dst->src[1];
+    const ggml_tensor * down  = dst->src[2];
+    const ggml_tensor * up    = dst->src[3];
+    const ggml_tensor * injw  = dst->src[4];
+
+    const int64_t n_embd   = x->ne[0];
+    const int64_t hc       = x->ne[1];
+    const int64_t n_tokens = x->ne[2];
+    const int64_t hc_dim   = n_embd*hc;
+    const int64_t lr       = down->ne[1];
+
+    float eps;
+    memcpy(&eps, dst->op_params, sizeof(float));
+
+    const float * gm = (const float *) gamma->data;
+
+    std::vector<float> xn(hc_dim);
+    std::vector<float> lo(lr);
+    std::vector<float> scratch(hc_dim);
+
+    for (int64_t t = params->ith; t < n_tokens; t += params->nth) {
+        const float * xt = (const float *) ((const char *) x->data + t*x->nb[2]);
+        float * out     = (float *) dst->data + t*n_embd;
+        float * out_inj = (float *) dst->data + n_tokens*n_embd + t*hc;
+        float * out_lo  = (float *) dst->data + n_tokens*(n_embd + (injw ? hc : 0)) + t*lr;
+
+        // per-stream rms norm * gamma
+        for (int64_t h = 0; h < hc; ++h) {
+            const float * xs = xt + h*n_embd;
+            double ms = 0.0;
+            for (int64_t i = 0; i < n_embd; ++i) {
+                ms += (double) xs[i]*xs[i];
+            }
+            const float r = 1.0f/sqrtf((float)(ms/n_embd) + eps);
+            for (int64_t i = 0; i < n_embd; ++i) {
+                xn[h*n_embd + i] = xs[i]*r*gm[h*n_embd + i];
+            }
+        }
+
+        // lo = silu(down(xn)/hc)
+        for (int64_t k = 0; k < lr; ++k) {
+            const float v = ggml_hc_mix_wrow_dot(down, k, xn.data(), hc_dim, scratch.data())/(float) hc;
+            lo[k] = v/(1.0f + expf(-v));
+            out_lo[k] = lo[k];
+        }
+
+        // mixed = mean_h(xn * sigmoid(up(lo)))
+        for (int64_t i = 0; i < n_embd; ++i) {
+            float acc = 0.0f;
+            for (int64_t h = 0; h < hc; ++h) {
+                const int64_t j = h*n_embd + i;
+                const float g = 1.0f/(1.0f + expf(-ggml_hc_mix_wrow_dot(up, j, lo.data(), lr, scratch.data())));
+                acc += xn[j]*g;
+            }
+            out[i] = acc/(float) hc;
+        }
+
+        if (injw) {
+            for (int64_t h = 0; h < hc; ++h) {
+                out_inj[h] = ggml_hc_mix_wrow_dot(injw, h, xn.data(), hc_dim, scratch.data());
+            }
+        }
+    }
+}
+
+void ggml_compute_forward_hc_mix(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    ggml_compute_forward_hc_mix_f32(params, dst);
+}
+
+// ggml_compute_forward_hc_combine
+
+static void ggml_compute_forward_hc_combine_f32(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * residual  = dst->src[0];
+    const ggml_tensor * block_out = dst->src[1];
+    const ggml_tensor * inject    = dst->src[2];
+
+    const int64_t n_embd   = residual->ne[0];
+    const int64_t hc       = residual->ne[1];
+    const int64_t n_tokens = residual->ne[2];
+
+    for (int64_t t = params->ith; t < n_tokens; t += params->nth) {
+        const float * rt = (const float *) ((const char *) residual->data  + t*residual->nb[2]);
+        const float * bt = (const float *) ((const char *) block_out->data + t*block_out->nb[1]);
+        const float * it = (const float *) ((const char *) inject->data    + t*inject->nb[1]);
+        float * out = (float *) ((char *) dst->data + t*dst->nb[2]);
+
+        for (int64_t h = 0; h < hc; ++h) {
+            const float w = 2.0f/(1.0f + expf(-it[h]/(float) hc));
+            for (int64_t i = 0; i < n_embd; ++i) {
+                out[h*n_embd + i] = rt[h*n_embd + i] + bt[i]*w;
+            }
+        }
+    }
+}
+
+void ggml_compute_forward_hc_combine(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    ggml_compute_forward_hc_combine_f32(params, dst);
+}
+
 // ggml_compute_forward_dsv4_hc_post
 
 static void ggml_compute_forward_dsv4_hc_post_f32(

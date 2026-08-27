@@ -266,6 +266,31 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
     const int64_t hc_dim = hc * n_embd;
     const int64_t nt     = x->ne[2];
 
+    // fused path: the whole mix chain in one op. Decode/verify only — the mm
+    // path wins at prefill widths. Weights must be F32/Q8_0 (the op contract).
+    // opt-in only: measured 2x SLOWER than the tuned mul_mv path even in the
+    // wide two-stage form — hand-rolled dots lose to the vectorized matvec
+    // kernels, and the glue around them was already fused. Kept for study.
+    static const bool hc_mix_enable = getenv("GGML_HC_MIX_ENABLE") != nullptr;
+    const bool w_ok = (w_down->type == GGML_TYPE_F32 || w_down->type == GGML_TYPE_Q8_0) &&
+                       w_up->type == w_down->type &&
+                      (!w_inject || w_inject->type == GGML_TYPE_F32);
+    if (hc_mix_enable && nt <= 8 && w_ok && n_embd % 32 == 0 && ggml_is_contiguous(x)) {
+        ggml_tensor * packed = ggml_hc_mix(ctx0, x, w_norm, w_down, w_up,
+                inject ? w_inject : nullptr, hparams.f_norm_rms_eps);
+        cb(packed, "hc_mix_fused", il);
+
+        ggml_tensor * mixed = ggml_view_2d(ctx0, packed, n_embd, nt,
+                n_embd*ggml_element_size(packed), 0);
+        if (inject) {
+            *inject = ggml_view_2d(ctx0, packed, hc, nt,
+                    hc*ggml_element_size(packed),
+                    n_embd*nt*ggml_element_size(packed));
+            cb(*inject, "hc_inject", il);
+        }
+        return mixed;
+    }
+
     // grouped RMSNorm: reduce over one stream, then scale all streams with the [hc_dim] gamma
     // the converter folded each gamma to (1 + w)
     ggml_tensor * xn = ggml_rms_norm(ctx0, x, hparams.f_norm_rms_eps);
@@ -309,6 +334,14 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_combine(
         int           il) {
     const int64_t hc = hparams.dsv4_hc_mult;
     const int64_t nt = residual->ne[2];
+
+    static const bool hc_ops_disable = getenv("GGML_HC_OPS_DISABLE") != nullptr;
+    if (!hc_ops_disable && nt <= 8 &&
+        ggml_is_contiguous(residual) && ggml_is_contiguous(block_out) && inject->nb[0] == sizeof(float)) {
+        ggml_tensor * cur = ggml_hc_combine(ctx0, residual, block_out, inject);
+        cb(cur, "hc_combine", il);
+        return cur;
+    }
 
     // 2*sigmoid centres the scatter weights on 1, so a zero injection is a plain residual add
     ggml_tensor * w = ggml_sigmoid(ctx0, ggml_scale(ctx0, inject, 1.0f / (float) hc));

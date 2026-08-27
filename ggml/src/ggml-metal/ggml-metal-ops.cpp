@@ -342,6 +342,11 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
             {
                 n_fuse = ggml_metal_op_dsv4_hc(ctx, idx);
             } break;
+        case GGML_OP_HC_MIX:
+        case GGML_OP_HC_COMBINE:
+            {
+                n_fuse = ggml_metal_op_hc(ctx, idx);
+            } break;
         case GGML_OP_SOFT_MAX:
             {
                 n_fuse = ggml_metal_op_soft_max(ctx, idx);
@@ -1385,6 +1390,101 @@ int ggml_metal_op_lightning_indexer(ggml_metal_op_t ctx, int idx) {
             (k->ne[2] + nkptg - 1)/nkptg,
             (q->ne[2] + nbptg - 1)/nbptg,
             q->ne[3], 32, nsg, 1);
+
+    return 1;
+}
+
+int ggml_metal_op_hc(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    switch (op->op) {
+        case GGML_OP_HC_MIX:
+            {
+                const ggml_tensor * x     = op->src[0];
+                const ggml_tensor * gamma = op->src[1];
+                const ggml_tensor * down  = op->src[2];
+                const ggml_tensor * up    = op->src[3];
+                const ggml_tensor * injw  = op->src[4];
+
+                ggml_metal_kargs_hc_mix args = {
+                    /*.n_embd     =*/ (int32_t) x->ne[0],
+                    /*.hc         =*/ (int32_t) x->ne[1],
+                    /*.lr         =*/ (int32_t) down->ne[1],
+                    /*.n_tokens   =*/ (int32_t) x->ne[2],
+                    /*.has_inject =*/ injw ? 1 : 0,
+                    /*.wq8        =*/ down->type == GGML_TYPE_Q8_0 ? 1 : 0,
+                    /*.eps        =*/ ggml_get_op_params_f32(op, 0),
+                    /*.nb_x2      =*/ x->nb[2],
+                    /*.nb_w1      =*/ down->nb[1],
+                    /*.nb_u1      =*/ up->nb[1],
+                    /*.nb_i1      =*/ injw ? injw->nb[1] : 0,
+                    /*.nb_d1      =*/ op->nb[1],
+                };
+
+                const int nsg = 8;
+
+                // stage 1: the low-rank bottleneck, wide across lo rows
+                {
+                    auto pipeline = ggml_metal_library_get_pipeline_hc_stage(ctx->lib, 1);
+                    ggml_metal_encoder_set_pipeline(enc, pipeline);
+                    ggml_metal_encoder_set_bytes (enc, &args, sizeof(args), 0);
+                    ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(x),     1);
+                    ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(gamma), 2);
+                    ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(down),  3);
+                    ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op),    4);
+                    ggml_metal_encoder_dispatch_threadgroups(enc,
+                            ((int) down->ne[1] + nsg - 1)/nsg, (int) x->ne[2], 1, 32, nsg, 1);
+                }
+
+                // stage 2 reads stage 1's lo block from dst
+                ggml_metal_op_concurrency_reset(ctx);
+
+                {
+                    auto pipeline = ggml_metal_library_get_pipeline_hc_stage(ctx->lib, 2);
+                    ggml_metal_encoder_set_pipeline(enc, pipeline);
+                    ggml_metal_encoder_set_bytes (enc, &args, sizeof(args), 0);
+                    ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(x),     1);
+                    ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(gamma), 2);
+                    ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(up),    3);
+                    ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(injw ? injw : up), 4);
+                    ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op),    5);
+                    ggml_metal_encoder_dispatch_threadgroups(enc,
+                            ((int) x->ne[0] + nsg - 1)/nsg, (int) x->ne[2], 1, 32, nsg, 1);
+                }
+            } break;
+        case GGML_OP_HC_COMBINE:
+            {
+                const ggml_tensor * residual  = op->src[0];
+                const ggml_tensor * block_out = op->src[1];
+                const ggml_tensor * inject    = op->src[2];
+
+                auto pipeline = ggml_metal_library_get_pipeline_hc(ctx->lib, op->op);
+                ggml_metal_encoder_set_pipeline(enc, pipeline);
+
+                ggml_metal_kargs_hc_combine args = {
+                    /*.n_embd   =*/ (int32_t) residual->ne[0],
+                    /*.hc       =*/ (int32_t) residual->ne[1],
+                    /*.n_tokens =*/ (int32_t) residual->ne[2],
+                    /*.nb_r2    =*/ residual->nb[2],
+                    /*.nb_b1    =*/ block_out->nb[1],
+                    /*.nb_i1    =*/ inject->nb[1],
+                    /*.nb_d2    =*/ op->nb[2],
+                };
+
+                ggml_metal_encoder_set_bytes (enc, &args, sizeof(args), 0);
+                ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(residual),  1);
+                ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(block_out), 2);
+                ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(inject),    3);
+                ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op),        4);
+
+                const int n = (int) (residual->ne[0]*residual->ne[1]);
+                const int nth = 256;
+                ggml_metal_encoder_dispatch_threadgroups(enc, (n + nth - 1)/nth, (int) residual->ne[2], 1, nth, 1, 1);
+            } break;
+        default: GGML_ABORT("fatal error");
+    }
 
     return 1;
 }
