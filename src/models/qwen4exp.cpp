@@ -1167,21 +1167,46 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
         // split_equal's n_keep_tail guarantee that the last K tokens share a ubatch.
         const int64_t K = (int64_t) cparams.n_rs_seq + 1;
 
-        for (int64_t t = 1; t <= K; ++t) {
-            const int64_t s_idx  = std::max<int64_t>(0, conv_input->ne[0] - state_cols - (K - t));
-            const int64_t s_slot = K - t;
-
-            ggml_tensor * tail = ggml_view_3d(ctx0, conv_input,
-                    state_cols, channels, n_seqs,
+        // opt-in only: the negative-stride single-cpy trips ggml's size math
+        // (wrapped nb3 breaks ggml_nbytes-based asserts). The honest fused form
+        // is a small snapshot-scatter kernel — on the ledger, not built.
+        static const bool snap_fuse_enable = getenv("GGML_CONV_SNAP_FUSE_ENABLE") != nullptr;
+        if (snap_fuse_enable && conv_input->ne[0] - state_cols >= K - 1) {
+            // the K snapshot sources step by exactly one column (slot K-1 is the
+            // oldest), so the whole set is ONE strided 4D copy instead of K
+            // dispatches — under draft-6 speculation this replaces 7 cpys per
+            // conv history per layer with one
+            ggml_tensor * tails = ggml_view_4d(ctx0, conv_input,
+                    state_cols, channels, n_seqs, K,
                     conv_input->nb[1], conv_input->nb[2],
-                    ggml_row_size(conv_input->type, s_idx));
+                    /*one column back per older slot*/ (uint64_t) -ggml_row_size(conv_input->type, 1),
+                    ggml_row_size(conv_input->type, conv_input->ne[0] - state_cols));
 
-            ggml_tensor * dst = ggml_view_2d(ctx0, conv_states_all,
-                    state_cols * channels, n_seqs,
+            ggml_tensor * dsts = ggml_view_3d(ctx0, conv_states_all,
+                    state_cols * channels, n_seqs, K,
                     conv_states_all->nb[1],
-                    (s_slot * mem_size + kv_head) * row_size);
+                    mem_size * row_size,
+                    kv_head * row_size);
 
-            ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_cont(ctx0, tail), dst));
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_cont(ctx0, tails),
+                    ggml_reshape_4d(ctx0, dsts, state_cols, channels, n_seqs, K)));
+        } else {
+            for (int64_t t = 1; t <= K; ++t) {
+                const int64_t s_idx  = std::max<int64_t>(0, conv_input->ne[0] - state_cols - (K - t));
+                const int64_t s_slot = K - t;
+
+                ggml_tensor * tail = ggml_view_3d(ctx0, conv_input,
+                        state_cols, channels, n_seqs,
+                        conv_input->nb[1], conv_input->nb[2],
+                        ggml_row_size(conv_input->type, s_idx));
+
+                ggml_tensor * dst = ggml_view_2d(ctx0, conv_states_all,
+                        state_cols * channels, n_seqs,
+                        conv_states_all->nb[1],
+                        (s_slot * mem_size + kv_head) * row_size);
+
+                ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_cont(ctx0, tail), dst));
+            }
         }
     }
 
