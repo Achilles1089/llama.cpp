@@ -1428,7 +1428,36 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         res->reset();
 
         ggml_backend_sched_reset(sched_sel);
-        ggml_backend_sched_set_eval_callback(sched_sel, cparams.cb_eval, cparams.cb_eval_user_data);
+        // diagnostic [GGML_NODE_HASH]: hash every node output of the first evals
+        // to bisect an A/B numeric divergence to a single op (forces defused,
+        // serialized execution via the eval callback — a match under this mode
+        // with a mismatch without it implicates fusion regrouping)
+        static const bool node_hash = getenv("GGML_NODE_HASH") != nullptr;
+        if (node_hash) {
+            static auto node_hash_cb = [](ggml_tensor * t, bool ask, void * ud) -> bool {
+                GGML_UNUSED(ud);
+                static int n = 0;
+                if (ask) {
+                    return n < 40000;
+                }
+                if (n >= 40000) {
+                    return true;
+                }
+                static std::vector<uint8_t> buf;
+                buf.resize(ggml_nbytes(t));
+                ggml_backend_tensor_get(t, buf.data(), 0, buf.size());
+                uint64_t h = 1469598103934665603ULL;
+                for (size_t i = 0; i < buf.size(); ++i) { h ^= buf[i]; h *= 1099511628211ULL; }
+                LLAMA_LOG_WARN("NHASH %d %s|%s [%lld,%lld,%lld,%lld] %016llx\n",
+                        n++, ggml_op_desc(t), t->name,
+                        (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3],
+                        (unsigned long long) h);
+                return true;
+            };
+            ggml_backend_sched_set_eval_callback(sched_sel, node_hash_cb, nullptr);
+        } else {
+            ggml_backend_sched_set_eval_callback(sched_sel, cparams.cb_eval, cparams.cb_eval_user_data);
+        }
 
         //const auto t_start_us = ggml_time_us();
 
@@ -1447,6 +1476,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
         }
+
     }
 
     // set the input data for the input tensors
@@ -1460,6 +1490,28 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     }
 
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+
+    // diagnostic [GGML_LOGIT_HASH]: per-eval logits fingerprint — pairs of
+    // serve runs can be diffed to localize the first numerically-diverging eval
+    {
+        static const bool logit_hash = getenv("GGML_LOGIT_HASH") != nullptr;
+        if (logit_hash && status == GGML_STATUS_SUCCESS && res->get_logits()) {
+            static int  eval_no = 0;
+            static std::vector<uint8_t> buf;
+            ggml_tensor * tl = res->get_logits();
+            // hash only the rows actually written (n_outputs), not the full
+            // ubatch-sized tensor — trailing rows are unwritten arena bytes
+            const size_t row = (size_t) tl->ne[0]*ggml_type_size(tl->type);
+            const size_t nb  = std::min(ggml_nbytes(tl), (size_t) n_outputs*row);
+            buf.resize(nb);
+            ggml_backend_sched_synchronize(sched_active);
+            ggml_backend_tensor_get(tl, buf.data(), 0, nb);
+            uint64_t h = 1469598103934665603ULL;
+            for (size_t i = 0; i < nb; ++i) { h ^= buf[i]; h *= 1099511628211ULL; }
+            LLAMA_LOG_WARN("LHASH %d gtype=%d n_tok=%d n_out=%d %016llx\n",
+                    eval_no++, (int) gtype, (int) ubatch.n_tokens, (int) n_outputs, (unsigned long long) h);
+        }
+    }
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;

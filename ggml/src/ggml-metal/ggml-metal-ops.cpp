@@ -1930,16 +1930,19 @@ int ggml_metal_op_ssm_conv(ggml_metal_op_t ctx, int idx) {
     GGML_TENSOR_LOCALS( int32_t, ne,  op,         ne);
     GGML_TENSOR_LOCALS(uint64_t, nb,  op,         nb);
 
-    // fuse a directly-following silu into the conv store (the GDN spine emits
-    // ssm_conv -> silu back to back); dst becomes the silu node
+    // opt-in: fuse a directly-following silu into the conv store (the GDN spine
+    // emits ssm_conv -> silu back to back); dst becomes the silu node.
+    // Default OFF: removing the SILU nodes regroups neighboring fusions on some
+    // archs (measured on qwen3next 27B) -> ulps drift, and the ~36-dispatch
+    // saving is below the measurement noise floor. Enable to re-evaluate.
     int n_fuse = 1;
     ggml_tensor * out = op;
     {
-        static const bool silu_fuse_disable = getenv("GGML_SSM_CONV_SILU_DISABLE") != nullptr;
+        static const bool silu_fuse_enable = getenv("GGML_SSM_CONV_SILU_ENABLE") != nullptr;
 
         const ggml_op fops[2] = { GGML_OP_SSM_CONV, GGML_OP_UNARY };
 
-        if (!silu_fuse_disable && ctx->use_fusion && ctx->can_fuse(idx, fops, 2)) {
+        if (silu_fuse_enable && ctx->use_fusion && ctx->can_fuse(idx, fops, 2)) {
             ggml_tensor * f1 = ctx->node(idx + 1);
 
             if (ggml_get_unary_op(f1) == GGML_UNARY_OP_SILU && f1->src[0] == op &&
