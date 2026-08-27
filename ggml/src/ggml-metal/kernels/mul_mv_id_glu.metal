@@ -38,12 +38,13 @@ kernel void kernel_mul_mv_id_q4_K_swiglu_f32(
     constexpr uint16_t kmask3 = 0xc0c0;
 
     const int islot = tgpig.z; // expert slot 0..n_expert_used-1
+    const int itok  = tgpig.y; // token 0..ne21-1
 
-    const int32_t i02 = ((device const int32_t *) ids)[islot];
+    const int32_t i02 = ((device const int32_t *) (ids + (int64_t)itok*args.nbi1))[islot];
 
     const int first_row = (tgpig.x * NSG + sgitg) * nr0;
 
-    device float * dst_f32 = (device float *) dst + (int64_t)islot*args.ne01;
+    device float * dst_f32 = (device float *) dst + ((int64_t)itok*args.nei0 + islot)*args.ne01;
 
     if (i02 < 0 || i02 >= args.ne02) {
         // masked/invalid slot: keep the output defined
@@ -66,7 +67,7 @@ kernel void kernel_mul_mv_id_q4_K_swiglu_f32(
 
     device const block_q4_K * xg = (device const block_q4_K *) (src_gate + offs_w);
     device const block_q4_K * xu = (device const block_q4_K *) (src_up   + offs_w);
-    device const float      * y  = (device const float      *) (src1);
+    device const float      * y  = (device const float      *) (src1 + (int64_t)itok*args.nb12);
 
     float yl[16];
     float yh[16];
@@ -226,15 +227,16 @@ kernel void kernel_mul_mv_id_q5_1_reduce_f32(
     constexpr short NR0 = MMID_GLU_NR0;
     constexpr short NQ  = 16;
 
-    const int r0 = (tgpig.x*NSG + sgitg)*NR0;
+    const int r0   = (tgpig.x*NSG + sgitg)*NR0;
+    const int itok = tgpig.y; // token 0..ne21-1
 
     const int nb = args.ne00/QK5_1;
 
     const short ix = tiisg/2;     // 16 blocks in flight
     const short il = (tiisg%2)*8; // half-block offset
 
-    device const int32_t * ids_i32 = (device const int32_t *) ids;
-    device const float   * wts_f32 = (device const float   *) wts;
+    device const int32_t * ids_i32 = (device const int32_t *) (ids + (int64_t)itok*args.nbi1);
+    device const float   * wts_f32 = (device const float   *) wts + (int64_t)itok*args.n_used;
 
     float sumf[NR0] = {0.f};
 
@@ -253,7 +255,7 @@ kernel void kernel_mul_mv_id_q5_1_reduce_f32(
             ax[row] = (device const block_q5_1 *) (src0 + (uint64_t)(r0 + row)*args.nb01 + (uint64_t)i02*args.nb02);
         }
 
-        device const float * y  = (device const float *) act + (int64_t)e*args.ne00;
+        device const float * y  = (device const float *) act + ((int64_t)itok*args.n_used + e)*args.ne00;
         device const float * yb = y + ix*QK5_1 + il;
 
         float acc[NR0] = {0.f};
@@ -283,7 +285,7 @@ kernel void kernel_mul_mv_id_q5_1_reduce_f32(
         }
     }
 
-    device float * dst_f32 = (device float *) dst;
+    device float * dst_f32 = (device float *) dst + (int64_t)itok*args.ne01;
 
     for (int row = 0; row < NR0; ++row) {
         const float tot = simd_sum(sumf[row]);

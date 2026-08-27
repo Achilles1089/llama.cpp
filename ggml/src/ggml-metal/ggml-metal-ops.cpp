@@ -2842,8 +2842,10 @@ static int ggml_metal_op_mul_mv_id_glu(ggml_metal_op_t ctx, int idx) {
         return 0;
     }
 
-    // decode only: one token, activations broadcast across the expert slots
-    if (gate->ne[2] != 1 || ids->ne[1] != 1 || x->ne[1] != 1 || x->ne[2] != 1) {
+    // decode/verify only: small token counts, activations broadcast across the
+    // expert slots (one column per token)
+    const int64_t ne21_a = gate->ne[2];
+    if (ne21_a < 1 || ne21_a > 8 || ids->ne[1] != ne21_a || x->ne[1] != 1 || x->ne[2] != ne21_a) {
         return 0;
     }
     if (x->type != GGML_TYPE_F32 || !ggml_is_contiguous(x)) {
@@ -2855,7 +2857,7 @@ static int ggml_metal_op_mul_mv_id_glu(ggml_metal_op_t ctx, int idx) {
     if (glu->type != GGML_TYPE_F32 || !ggml_is_contiguous(glu)) {
         return 0;
     }
-    if (glu->ne[0] != wg->ne[1] || glu->ne[1] != ids->ne[0]) {
+    if (glu->ne[0] != wg->ne[1] || glu->ne[1] != ids->ne[0] || glu->ne[2] != ne21_a) {
         return 0;
     }
 
@@ -2893,8 +2895,12 @@ static int ggml_metal_op_mul_mv_id_glu(ggml_metal_op_t ctx, int idx) {
         /*.ne00 =*/ (int32_t) wg->ne[0],
         /*.ne01 =*/ (int32_t) wg->ne[1],
         /*.ne02 =*/ (int32_t) wg->ne[2],
+        /*.nei0 =*/ (int32_t) ids->ne[0],
+        /*.ne21 =*/ (int32_t) ne21_a,
         /*.nb01 =*/ wg->nb[1],
         /*.nb02 =*/ wg->nb[2],
+        /*.nb12 =*/ x->nb[2],
+        /*.nbi1 =*/ ids->nb[1],
     };
 
     ggml_metal_encoder_set_pipeline(enc, pipeline);
@@ -2908,7 +2914,7 @@ static int ggml_metal_op_mul_mv_id_glu(ggml_metal_op_t ctx, int idx) {
     const int n_used = (int) ids->ne[0];
     const int nrptg  = 1*4; // MMID_GLU_NR0 * MMID_GLU_NSG
 
-    ggml_metal_encoder_dispatch_threadgroups(enc, ((int) wg->ne[1] + nrptg - 1)/nrptg, 1, n_used, 32, 4, 1);
+    ggml_metal_encoder_dispatch_threadgroups(enc, ((int) wg->ne[1] + nrptg - 1)/nrptg, (int) ne21_a, n_used, 32, 4, 1);
 
     return 3;
 }
@@ -2948,7 +2954,8 @@ static int ggml_metal_op_mul_mv_id_reduce(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * mul  = gf->nodes[i0 + 1];
 
     ggml_tensor * ids = mmid->src[2];
-    if (!ids || ids->type != GGML_TYPE_I32 || ids->ne[1] != 1) {
+    const int64_t ne21_r = mmid->ne[2];
+    if (!ids || ids->type != GGML_TYPE_I32 || ne21_r < 1 || ne21_r > 8 || ids->ne[1] != ne21_r) {
         return 0;
     }
 
@@ -3011,9 +3018,8 @@ static int ggml_metal_op_mul_mv_id_reduce(ggml_metal_op_t ctx, int idx) {
     }
 
     ggml_tensor * wts = mul->src[1];
-    if (!wts || wts->type != GGML_TYPE_F32 ||
-        wts->ne[0] != 1 || wts->ne[1] != n_used || wts->ne[2] != 1 || wts->ne[3] != 1 ||
-        wts->nb[1] != sizeof(float)) {
+    if (!wts || wts->type != GGML_TYPE_F32 || !ggml_is_contiguous(wts) ||
+        wts->ne[0] != 1 || wts->ne[1] != n_used || wts->ne[2] != ne21_r || wts->ne[3] != 1) {
         return 0;
     }
 
@@ -3021,7 +3027,7 @@ static int ggml_metal_op_mul_mv_id_reduce(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * views[16] = { nullptr };
     for (int v = 0; v < n_used; ++v) {
         ggml_tensor * t = view_nodes[v];
-        if (t->src[0] != mul || t->ne[0] != mul->ne[0] || t->ne[1] != 1) {
+        if (t->src[0] != mul || t->ne[0] != mul->ne[0] || t->ne[1] != ne21_r) {
             return 0;
         }
         const ptrdiff_t off = (const char *) t->data - (const char *) mul->data;
@@ -3057,15 +3063,15 @@ static int ggml_metal_op_mul_mv_id_reduce(ggml_metal_op_t ctx, int idx) {
         return 0;
     }
 
-    // decode only: one token, one activation column per expert slot
-    if (mmid->ne[2] != 1 || x->ne[1] != n_used || x->ne[2] != 1) {
+    // decode/verify only: small token counts, one activation column per slot
+    if (x->ne[1] != n_used || x->ne[2] != ne21_r) {
         return 0;
     }
     if (x->type != GGML_TYPE_F32 || !ggml_is_contiguous(x)) {
         return 0;
     }
     if (dst->type != GGML_TYPE_F32 || !ggml_is_contiguous(dst) ||
-        dst->ne[0] != w->ne[1] || dst->ne[1] != 1) {
+        dst->ne[0] != w->ne[1] || dst->ne[1] != ne21_r) {
         return 0;
     }
 
@@ -3104,8 +3110,10 @@ static int ggml_metal_op_mul_mv_id_reduce(ggml_metal_op_t ctx, int idx) {
         /*.ne01   =*/ (int32_t) w->ne[1],
         /*.ne02   =*/ (int32_t) w->ne[2],
         /*.n_used =*/ n_used,
+        /*.ne21   =*/ (int32_t) ne21_r,
         /*.nb01   =*/ w->nb[1],
         /*.nb02   =*/ w->nb[2],
+        /*.nbi1   =*/ ids->nb[1],
     };
 
     ggml_metal_encoder_set_pipeline(enc, pipeline);
@@ -3118,7 +3126,7 @@ static int ggml_metal_op_mul_mv_id_reduce(ggml_metal_op_t ctx, int idx) {
 
     const int nrptg = 1*4; // MMID_GLU_NR0 * MMID_GLU_NSG
 
-    ggml_metal_encoder_dispatch_threadgroups(enc, ((int) w->ne[1] + nrptg - 1)/nrptg, 1, 1, 32, 4, 1);
+    ggml_metal_encoder_dispatch_threadgroups(enc, ((int) w->ne[1] + nrptg - 1)/nrptg, (int) ne21_r, 1, 32, 4, 1);
 
     return 1 + n_used; // mmid + mul + (n_used-1) adds, filtered
 }

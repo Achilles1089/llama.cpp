@@ -4752,9 +4752,10 @@ struct test_moe_down_reduce : public test_case {
     const int n_used;
     const int64_t m; // output rows (n_embd)
     const int64_t k; // expert FFN width
+    const int64_t n_tokens;
 
     std::string vars() override {
-        return VARS_TO_STR5(type_a, n_mats, n_used, m, k);
+        return VARS_TO_STR6(type_a, n_mats, n_used, m, k, n_tokens);
     }
 
     std::string op_desc(ggml_tensor * t) override {
@@ -4769,8 +4770,8 @@ struct test_moe_down_reduce : public test_case {
     bool run_whole_graph() override { return true; }
 
     test_moe_down_reduce(ggml_type type_a = GGML_TYPE_Q5_1,
-            int n_mats = 16, int n_used = 4, int64_t m = 64, int64_t k = 32)
-        : type_a(type_a), n_mats(n_mats), n_used(n_used), m(m), k(k) {
+            int n_mats = 16, int n_used = 4, int64_t m = 64, int64_t k = 32, int64_t n_tokens = 1)
+        : type_a(type_a), n_mats(n_mats), n_used(n_used), m(m), k(k), n_tokens(n_tokens) {
             GGML_ASSERT(n_used <= n_mats);
         }
 
@@ -4778,24 +4779,24 @@ struct test_moe_down_reduce : public test_case {
         ggml_tensor * as = ggml_new_tensor_3d(ctx, type_a, k, m, n_mats);
         ggml_set_name(as, "as");
 
-        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, 1);
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, n_tokens);
         ggml_set_name(ids, "ids");
         if (n_used != n_mats) {
-            ids = ggml_view_2d(ctx, ids, n_used, 1, ids->nb[1], 0);
+            ids = ggml_view_2d(ctx, ids, n_used, n_tokens, ids->nb[1], 0);
         }
 
-        ggml_tensor * act = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, n_used, 1);
+        ggml_tensor * act = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, n_used, n_tokens);
         ggml_set_name(act, "act");
 
-        ggml_tensor * wts = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, n_used, 1);
+        ggml_tensor * wts = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, n_used, n_tokens);
         ggml_set_name(wts, "wts");
 
-        ggml_tensor * experts = ggml_mul_mat_id(ctx, as, act, ids); // [m, n_used, 1]
+        ggml_tensor * experts = ggml_mul_mat_id(ctx, as, act, ids); // [m, n_used, n_tokens]
         experts = ggml_mul(ctx, experts, wts);
 
         ggml_tensor * cur_experts[16];
         for (int i = 0; i < n_used; ++i) {
-            cur_experts[i] = ggml_view_2d(ctx, experts, m, 1, experts->nb[2], i*experts->nb[1]);
+            cur_experts[i] = ggml_view_2d(ctx, experts, m, n_tokens, experts->nb[2], i*experts->nb[1]);
         }
 
         ggml_tensor * moe_out = cur_experts[0];
@@ -10113,11 +10114,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_moe_down_reduce(GGML_TYPE_Q5_1, 512, 10, 2560, 640));
     test_cases.emplace_back(new test_moe_down_reduce(GGML_TYPE_Q5_1, 32, 4, 128, 64));
     test_cases.emplace_back(new test_moe_down_reduce(GGML_TYPE_Q5_1, 16, 2, 96, 32));
+    test_cases.emplace_back(new test_moe_down_reduce(GGML_TYPE_Q5_1, 512, 10, 2560, 640, 3)); // MTP verify batch
+    test_cases.emplace_back(new test_moe_down_reduce(GGML_TYPE_Q5_1, 32, 4, 128, 64, 7));
 
     // Metal fused mul_mv_id + swiglu at MoE decode shapes (Qwen3.8-Flash-Next:
     // 512 experts, top-10, 2560 -> 640, broadcast activations, one token)
     test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q4_K, GGML_GLU_OP_SWIGLU, 1, 640, 2560,
         true, 512, 10, true, false, true, false));
+    test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q4_K, GGML_GLU_OP_SWIGLU, 3, 640, 2560,
+        true, 512, 10, true, false, true, false)); // MTP verify batch
+    test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q4_K, GGML_GLU_OP_SWIGLU, 7, 64, 512,
+        true, 32, 4, true, false, true, false));
     test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q4_K, GGML_GLU_OP_SWIGLU, 1, 64, 512,
         true, 32, 4, true, false, true, false));
     test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q4_K, GGML_GLU_OP_SWIGLU, 1, 40, 256,

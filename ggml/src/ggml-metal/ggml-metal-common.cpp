@@ -438,7 +438,7 @@ void ggml_graph_optimize(ggml_cgraph * gf) {
                         ggml_get_glu_op(glu) == GGML_GLU_OP_SWIGLU &&
                         gf->nodes[i + 0]->src[0]->type == GGML_TYPE_Q4_K &&
                         gf->nodes[i + 1]->src[0]->type == GGML_TYPE_Q4_K &&
-                        gf->nodes[i + 0]->ne[2] == 1;
+                        gf->nodes[i + 0]->ne[2] <= 8;
             }
 
             const int outs1[1] = { i + 2 };
@@ -461,7 +461,7 @@ void ggml_graph_optimize(ggml_cgraph * gf) {
             gf->nodes[i + 1]->src[0] == gf->nodes[i] &&
             gf->nodes[i]->src[2] != nullptr &&
             gf->nodes[i]->src[0]->type == GGML_TYPE_Q5_1 &&
-            gf->nodes[i]->ne[2] == 1) {
+            gf->nodes[i]->ne[2] <= 8) {
             const int n_used = (int) gf->nodes[i]->src[2]->ne[0];
             const int n_span = 2 + n_used + (n_used - 1);
 
