@@ -2244,7 +2244,16 @@ int ggml_metal_op_gated_delta_net(ggml_metal_op_t ctx, int idx) {
         /*.nb1  =*/ nb1,
         /*.nb2  =*/ nb2,
         /*.nb3  =*/ nb3,
+        /*.zc          =*/ ggml_get_op_params_i32(op, 1),
+        /*.zc_kv_head  =*/ ggml_get_op_params_i32(op, 2),
+        /*.zc_mem_size =*/ ggml_get_op_params_i32(op, 3),
+        /*.zc_nb1      =*/ op->src[5]->nb[1],
     };
+
+    // zero-copy mode reads AND writes the cache through the state binding; the
+    // s_copy indirection rides binding 7 (bind the state again as a dummy when
+    // the op is not zc so the argument is always valid)
+    const ggml_tensor * scopy = op->src[6] ? op->src[6] : op->src[5];
 
     ggml_metal_encoder_set_pipeline(enc, pipeline);
     ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args),                  ida++);
@@ -2254,6 +2263,7 @@ int ggml_metal_op_gated_delta_net(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[3]), ida++); // gate
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[4]), ida++); // beta
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[5]), ida++); // state
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(scopy),      ida++); // s_copy
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         ida++); // dst
 
     const int nsg = pipeline.nsg;

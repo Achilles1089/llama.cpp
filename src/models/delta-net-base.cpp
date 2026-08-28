@@ -538,12 +538,43 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
     const auto   kv_head    = mctx_cur->get_head();
     const uint32_t mem_size = mctx_cur->get_size();
 
-    const int64_t S_v          = s->ne[0];
-    const int64_t H_v          = s->ne[2];
-    const int64_t n_seqs       = s->ne[3];
+    const int64_t S_v          = v->ne[0];
+    const int64_t H_v          = v->ne[1];
+    const int64_t n_seqs       = v->ne[3];
     const int64_t n_seq_tokens = q->ne[2];
 
     const bool keep = cparams.n_rs_seq > 0;
+
+    // zero-copy state path (s == nullptr): the kernel reads the recurrent cache
+    // through s_copy (rollback planes included) and writes the K snapshot
+    // planes back at cache strides — no gather, no copy-backs. The caller
+    // emitted the rs_z fresh-seq clear via build_rs_zero.
+    if (s == nullptr) {
+        const int64_t Kzc = keep ? (int64_t) cparams.n_rs_seq + 1 : 1;
+
+        ggml_tensor * gdn_out = ggml_gated_delta_net_zc(ctx0, q, k, v, g, b,
+                ssm_states_all, inp->s_copy_main, Kzc,
+                (int32_t) kv_head, (int32_t) mem_size);
+        if (n_seq_tokens > 1) {
+            res->add_fused_node({LLM_FUSED_OP_GDN_CH, gdn_out, il});
+        } else {
+            res->add_fused_node({LLM_FUSED_OP_GDN_AR, gdn_out, il});
+        }
+
+        // the op writes the cache in place through src[5]; expand it so the
+        // write is anchored in the graph even though only scores flow onward
+        ggml_build_forward_expand(gf, gdn_out);
+
+        ggml_tensor * output = ggml_view_4d(ctx0, gdn_out,
+            S_v, H_v, n_seq_tokens, n_seqs,
+            ggml_row_size(gdn_out->type, S_v),
+            ggml_row_size(gdn_out->type, S_v * H_v),
+            ggml_row_size(gdn_out->type, S_v * H_v * n_seq_tokens),
+            0);
+        cb(output, "attn_output", il);
+
+        return output;
+    }
 
     if (!keep) {
         auto attn_out = build_delta_net(q, k, v, g, b, s, il);

@@ -6295,6 +6295,65 @@ struct ggml_tensor * ggml_solve_tri(
     return result;
 }
 
+// ggml_gated_delta_net_zc
+
+struct ggml_tensor * ggml_gated_delta_net_zc(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * g,
+        struct ggml_tensor  * beta,
+        struct ggml_tensor  * states,
+        struct ggml_tensor  * s_copy,
+        int64_t               K,
+        int32_t               kv_head,
+        int32_t               mem_size) {
+    GGML_ASSERT(ggml_is_contiguous_rows(q));
+    GGML_ASSERT(ggml_is_contiguous_rows(k));
+    GGML_ASSERT(ggml_is_contiguous_rows(v));
+    GGML_ASSERT(ggml_is_contiguous(g));
+    GGML_ASSERT(ggml_is_contiguous(beta));
+
+    GGML_ASSERT(states->type == GGML_TYPE_F32);
+    GGML_ASSERT(states->nb[0] == sizeof(float));
+    GGML_ASSERT(s_copy->type == GGML_TYPE_I32);
+
+    const int64_t S_v      = v->ne[0];
+    const int64_t H        = v->ne[1];
+    const int64_t n_tokens = v->ne[2];
+    const int64_t n_seqs   = v->ne[3];
+
+    GGML_ASSERT(g->ne[0] == 1 || g->ne[0] == S_v);
+    GGML_ASSERT(beta->ne[0] == 1);
+
+    GGML_ASSERT(states->ne[0] == S_v*S_v*H);        // one cache row = one seq state
+    GGML_ASSERT(states->ne[1] >= (int64_t) mem_size*K);
+    GGML_ASSERT(s_copy->ne[0] == n_seqs);
+    GGML_ASSERT(K >= 1);
+    GGML_ASSERT(kv_head >= 0 && kv_head + n_seqs <= mem_size);
+
+    // scores only: the state lives in the cache
+    const int64_t ne[4] = { S_v * H, n_tokens * n_seqs, 1, 1 };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    ggml_set_op_params_i32(result, 0, (int32_t) K);
+    ggml_set_op_params_i32(result, 1, 1); // zc
+    ggml_set_op_params_i32(result, 2, kv_head);
+    ggml_set_op_params_i32(result, 3, mem_size);
+
+    result->op     = GGML_OP_GATED_DELTA_NET;
+    result->src[0] = q;
+    result->src[1] = k;
+    result->src[2] = v;
+    result->src[3] = g;
+    result->src[4] = beta;
+    result->src[5] = states;
+    result->src[6] = s_copy;
+
+    return result;
+}
+
 // ggml_gated_delta_net
 
 struct ggml_tensor * ggml_gated_delta_net(

@@ -101,7 +101,21 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
     const int64_t hc_dim = hc * n_embd;
     const int64_t hc_lr  = hparams.hc_low_rank;
 
-    tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, 0);
+    // A2 loader placement: token_embd (0.68 GB, hot) defaults onto the output
+    // device so its per-token gather joins the single Metal submission; under
+    // mmap this is a zero-copy remap. Kill switch: GGML_EMBD_INPUT_CPU=1.
+    //
+    // The PLE n-gram table (28.8 GB) must stay CPU-pinned: placing it on Metal
+    // pushes the GPU working set past the M1 Ultra budget (~122 GB) and the
+    // residency manager thrashes every submission (measured: 12-minute crawl,
+    // negative free in the memory breakdown). The CPU-side gather faults in
+    // only the hash-hit rows — that is the 128 GB box's survival strategy, not
+    // a placement defect. (-ot overrides additionally copy instead of map and
+    // silently corrupt the lazy table.)
+    static const bool embd_input_cpu = getenv("GGML_EMBD_INPUT_CPU") != nullptr;
+    const int embd_dev_flag = embd_input_cpu ? 0 : llama_model_loader::TENSOR_ON_OUTPUT_DEV;
+
+    tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, embd_dev_flag);
 
     // there is no output_norm: the final hyper-connection mixer carries it
     hc_head_norm = create_tensor(tn(LLM_TENSOR_HC_HEAD_NORM, "weight"), { hc_dim }, 0);
@@ -893,9 +907,20 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
     ggml_tensor * conv_input = build_conv_state_at(inp, conv_states_all, qkv_mixed,
             conv_kernel_size - 1, conv_channels, il);
 
-    ggml_tensor * state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
-    state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
-    cb(state, "state_predelta", il);
+    // zero-copy delta state (A3): skip the gather — the kernel reads/writes the
+    // cache directly. Requires the identity window (n_rs == n_seqs); kill
+    // switch GGML_GDN_ZC_DISABLE restores the gather + copy-back path.
+    static const bool gdn_zc_disable = getenv("GGML_GDN_ZC_DISABLE") != nullptr;
+    const bool gdn_zc = !gdn_zc_disable && mctx_cur->get_n_rs() == (uint32_t) n_seqs;
+
+    ggml_tensor * state = nullptr;
+    if (gdn_zc) {
+        build_rs_zero(inp, ssm_states_all, hparams.n_embd_s());
+    } else {
+        state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
+        state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
+        cb(state, "state_predelta", il);
+    }
 
     ggml_tensor * conv_output_proper = ggml_ssm_conv(ctx0, conv_input, conv_kernel);
     cb(conv_output_proper, "conv_output_raw", il);

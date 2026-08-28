@@ -3476,6 +3476,20 @@ llm_graph_input_rs * llm_graph_context::build_rs_inp() const {
     return (llm_graph_input_rs *) res->add_input(std::move(inp));
 }
 
+void llm_graph_context::build_rs_zero(
+        llm_graph_input_rs * inp,
+        ggml_tensor * s,
+        int32_t state_size) const {
+    const auto * kv_state = inp->mctx;
+    const int32_t rs_zero = kv_state->get_rs_z();
+
+    ggml_tensor * states = ggml_reshape_2d(ctx0, s, state_size, ggml_nelements(s)/state_size);
+
+    // no-op when the view is zero-sized (no fresh sequence this ubatch)
+    ggml_tensor * state_zero = ggml_view_1d(ctx0, states, state_size*(rs_zero >= 0), rs_zero*states->nb[1]*(rs_zero >= 0));
+    ggml_build_forward_expand(gf, ggml_scale_inplace(ctx0, state_zero, 0));
+}
+
 ggml_tensor * llm_graph_context::build_rs(
         llm_graph_input_rs * inp,
         ggml_tensor * s,

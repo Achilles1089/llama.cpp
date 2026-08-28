@@ -10772,7 +10772,7 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
     GGML_ASSERT(ggml_is_contiguous_rows(src_v));
     GGML_ASSERT(ggml_is_contiguous(src_g));
     GGML_ASSERT(ggml_is_contiguous(src_beta));
-    GGML_ASSERT(ggml_is_contiguous(src_state));
+    GGML_ASSERT(src_state->nb[0] == sizeof(float)); // zc mode: 2D cache, rows may stride
 
     GGML_ASSERT(src_g->ne[0] == 1 || src_g->ne[0] == S_v);
     GGML_ASSERT(src_beta->ne[0] == 1);
@@ -10794,6 +10794,15 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
     GGML_ASSERT(K >= 1);
     // per-seq stride in floats (seq s starts at state + s * seq_stride)
     const int64_t state_seq_stride = src_state->nb[3] / sizeof(float);
+
+    // zero-copy mode: src_state IS the recurrent cache; reads follow s_copy,
+    // writes land on the slot plane rows directly
+    const bool      zc          = ggml_get_op_params_i32(dst, 1) != 0;
+    const int64_t   zc_kv_head  = ggml_get_op_params_i32(dst, 2);
+    const int64_t   zc_mem_size = ggml_get_op_params_i32(dst, 3);
+    const int64_t   zc_row_f    = src_state->nb[1] / sizeof(float);
+    const int32_t * zc_copy     = zc ? (const int32_t *) dst->src[6]->data : nullptr;
+    float         * zc_cache    = zc ? (float *) src_state->data : nullptr;
 
     const int64_t per_thread = S_v + (K > 1 ? S_v * S_v : 0);
     const int ith = params->ith;
@@ -10835,12 +10844,18 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
         // For K>1, work in scratch and copy out per-token when the slot is in range.
         float * s_out = (K > 1)
             ? state_work
-            : state_out_base + (iv3 * H + iv1) * S_v * S_v;
+            : (zc ? zc_cache + (zc_kv_head + iv3) * zc_row_f + iv1 * S_v * S_v
+                  : state_out_base + (iv3 * H + iv1) * S_v * S_v);
 
         // copy input state into the working buffer and operate in-place
-        // state layout [S_v, S_v, H, n_seqs]: seq iv3 starts at iv3 * state_seq_stride.
-        const float * s_in = state_in_base + iv3 * state_seq_stride + iv1 * S_v * S_v;
-        memcpy(s_out, s_in, S_v * S_v * sizeof(float));
+        // state layout [S_v, S_v, H, n_seqs]: seq iv3 starts at iv3 * state_seq_stride;
+        // in zero-copy mode the read row comes from s_copy (rollback planes included)
+        const float * s_in = zc
+            ? zc_cache + (int64_t) zc_copy[iv3] * zc_row_f + iv1 * S_v * S_v
+            : state_in_base + iv3 * state_seq_stride + iv1 * S_v * S_v;
+        if (s_in != s_out) {
+            memcpy(s_out, s_in, S_v * S_v * sizeof(float));
+        }
 
         // attn output pointer for first token of this (head, seq)
         float * attn_data = attn_out_base + (iv3 * n_tokens * H + iv1) * S_v;
@@ -10893,8 +10908,9 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
             if (K > 1) {
                 const int64_t target_slot = n_tokens - 1 - t;
                 if (target_slot >= 0 && target_slot < K) {
-                    float * curr_state_o = state_out_base + target_slot * state_size_per_snap +
-                                     (iv3 * H + iv1) * S_v * S_v;
+                    float * curr_state_o = zc
+                        ? zc_cache + (target_slot * zc_mem_size + zc_kv_head + iv3) * zc_row_f + iv1 * S_v * S_v
+                        : state_out_base + target_slot * state_size_per_snap + (iv3 * H + iv1) * S_v * S_v;
                     memcpy(curr_state_o, s_out, S_v * S_v * sizeof(float));
                 }
             }

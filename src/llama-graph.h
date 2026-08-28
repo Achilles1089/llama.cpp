@@ -1305,6 +1305,14 @@ struct llm_graph_context {
     //       when moving, avoid passing `ggml_cgraph` - only pass `ggml_context`. would likely need to split the
     //         implementation in 2 separate methods. the goal is to avoid calling `ggml_build_forward_expand` in
     //         `llama_memory_recurrent`
+    // emit only the fresh-sequence zero-clear of the recurrent cache (the
+    // side effect build_rs carries); for zero-copy state ops that skip the
+    // gather entirely
+    void build_rs_zero(
+            llm_graph_input_rs * inp,
+            ggml_tensor * s,
+            int32_t state_size) const;
+
     ggml_tensor * build_rs(
             ggml_tensor * s,
             ggml_tensor * state_copy_main,

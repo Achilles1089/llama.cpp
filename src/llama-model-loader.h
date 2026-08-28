@@ -67,6 +67,10 @@ struct llama_model_loader {
     static const int TENSOR_DUPLICATED      = 1 << 1;
     static const int TENSOR_SKIP            = 1 << 2;
     static const int TENSOR_SKIP_IF_VIRTUAL = 1 << 3;
+    // route an input-layer (bid == -1) tensor to the output device's buffer list
+    // instead of the CPU-pinned input list; under mmap this is a zero-copy remap
+    // (buffer_from_host_ptr), so it composes with TENSOR_READ_LAZY
+    static const int TENSOR_ON_OUTPUT_DEV   = 1 << 6;
     static const int TENSOR_ALLOW_RESHAPE   = 1 << 4;
     static const int TENSOR_READ_LAZY       = 1 << 5; // read rows on demand instead of loading whole tensor; requires mmap for now
 

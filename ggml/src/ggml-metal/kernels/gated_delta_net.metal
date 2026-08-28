@@ -13,7 +13,8 @@ kernel void kernel_gated_delta_net_impl(
         device const char * v,
         device const char * g,
         device const char * b,
-        device const char * s,
+        device       char * s,
+        device const char * scopy,
         device       char * dst,
         uint3 tgpig[[threadgroup_position_in_grid]],
         uint3 tpitg[[thread_position_in_threadgroup]],
@@ -34,10 +35,17 @@ kernel void kernel_gated_delta_net_impl(
 
     const float scale = 1.0f / sqrt((float)S_v);
 
-    // input state layout [S_v, S_v, H, n_seqs] (s0 only): per-seq stride is H*D.
-    // state is stored transposed: M[i20][is] = S[is][i20], so row i20 is contiguous
-    const uint state_in_base = (i23*args.ne21 + i21)*S_v*S_v + i20*S_v;
-    device const float * s_ptr = (device const float *) (s) + state_in_base;
+    // input state: dense scratch [S_v, S_v, H, n_seqs] (s0 only), OR — zero-copy
+    // mode — the recurrent cache itself, with the per-seq read row (rollback
+    // planes included) taken from s_copy. state is stored transposed:
+    // M[i20][is] = S[is][i20], so row i20 is contiguous
+    device const float * s_ptr;
+    if (args.zc) {
+        const int row = ((device const int *) scopy)[i23];
+        s_ptr = (device const float *) (s + (uint64_t) row*args.zc_nb1) + i21*S_v*S_v + i20*S_v;
+    } else {
+        s_ptr = (device const float *) (s) + (i23*args.ne21 + i21)*S_v*S_v + i20*S_v;
+    }
 
     float ls[NSG];
 
@@ -116,7 +124,13 @@ kernel void kernel_gated_delta_net_impl(
         if (K > 1) {
             const int target_slot = (int)args.ne22 - 1 - (int)t;
             if (target_slot >= 0 && target_slot < (int)K) {
-                device float * dst_state = (device float *) (dst) + attn_size + (uint)target_slot * state_size_per_snap + state_out_base;
+                device float * dst_state;
+                if (args.zc) {
+                    const int row = target_slot*args.zc_mem_size + args.zc_kv_head + (int) i23;
+                    dst_state = (device float *) (s + (uint64_t) row*args.zc_nb1) + i21*S_v*S_v + i20*S_v;
+                } else {
+                    dst_state = (device float *) (dst) + attn_size + (uint)target_slot * state_size_per_snap + state_out_base;
+                }
                 FOR_UNROLL (short j = 0; j < NSG; j++) {
                     const short is = tx*NSG + j;
                     dst_state[is] = ls[j];
@@ -126,7 +140,13 @@ kernel void kernel_gated_delta_net_impl(
     }
 
     if (K == 1) {
-        device float * dst_state = (device float *) (dst) + attn_size + state_out_base;
+        device float * dst_state;
+        if (args.zc) {
+            const int row = args.zc_kv_head + (int) i23;
+            dst_state = (device float *) (s + (uint64_t) row*args.zc_nb1) + i21*S_v*S_v + i20*S_v;
+        } else {
+            dst_state = (device float *) (dst) + attn_size + state_out_base;
+        }
         FOR_UNROLL (short j = 0; j < NSG; j++) {
             const short is = tx*NSG + j;
             dst_state[is] = ls[j];

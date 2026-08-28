@@ -2661,6 +2661,25 @@ extern "C" {
             struct ggml_tensor  * src,
             struct ggml_tensor  * states);
 
+    // zero-copy gated delta net: the recurrent state is read from and written
+    // to the cache tensor directly, replacing the gather + K plane copy-backs.
+    //   states [n_embd_s, >= mem_size*K] the recurrent cache (written in place!)
+    //   s_copy I32 [n_seqs] per-seq read row (rollback planes included)
+    // writes: slot k of seq b -> row k*mem_size + kv_head + b.
+    // dst carries the attention scores only: [S_v*H, n_tokens*n_seqs].
+    GGML_API struct ggml_tensor * ggml_gated_delta_net_zc(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * g,
+            struct ggml_tensor  * beta,
+            struct ggml_tensor  * states,
+            struct ggml_tensor  * s_copy,
+            int64_t               K,
+            int32_t               kv_head,
+            int32_t               mem_size);
+
     GGML_API struct ggml_tensor * ggml_dsv4_hc_comb(
             struct ggml_context * ctx,
             struct ggml_tensor  * mixes,

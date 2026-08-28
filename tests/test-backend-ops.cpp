@@ -4341,6 +4341,65 @@ struct test_rwkv_wkv6 : public test_case {
 };
 
 // GGML_OP_GATED_DELTA_NET
+// zero-copy variant: state read from / written to a strided cache tensor via s_copy
+struct test_gated_delta_net_zc : public test_case {
+    const int64_t head_count, head_size, n_seq_tokens, n_seqs, K, mem_size, kv_head;
+    const bool rollback_read; // point s_copy at a plane row instead of the live row
+
+    std::string vars() override {
+        return VARS_TO_STR8(head_count, head_size, n_seq_tokens, n_seqs, K, mem_size, kv_head, rollback_read);
+    }
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "GATED_DELTA_NET_ZC"; }
+    double max_nmse_err() override { return 5e-6; }
+
+    test_gated_delta_net_zc(int64_t head_count = 4, int64_t head_size = 32,
+            int64_t n_seq_tokens = 1, int64_t n_seqs = 1, int64_t K = 1,
+            int64_t mem_size = 2, int64_t kv_head = 0, bool rollback_read = false)
+        : head_count(head_count), head_size(head_size), n_seq_tokens(n_seq_tokens),
+          n_seqs(n_seqs), K(K), mem_size(mem_size), kv_head(kv_head), rollback_read(rollback_read) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_size, head_count, n_seq_tokens, n_seqs);
+        ggml_tensor * k = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_size, head_count, n_seq_tokens, n_seqs);
+        ggml_tensor * v = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_size, head_count, n_seq_tokens, n_seqs);
+        ggml_tensor * g = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, head_count, n_seq_tokens, n_seqs);
+        ggml_tensor * b = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, head_count, n_seq_tokens, n_seqs);
+
+        const int64_t row = head_size*head_size*head_count;
+        ggml_tensor * states = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, row, mem_size*K);
+        ggml_set_name(states, "states");
+
+        ggml_tensor * s_copy = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_seqs);
+        ggml_set_name(s_copy, "s_copy");
+
+        ggml_tensor * out = ggml_gated_delta_net_zc(ctx, q, k, v, g, b, states, s_copy,
+                K, (int32_t) kv_head, (int32_t) mem_size);
+        ggml_set_name(out, "out");
+
+        // anchor the in-place cache writes and compare them too: sum the cache
+        // into the graph output so both backends' plane writes are checked
+        ggml_tensor * chk = ggml_add(ctx, ggml_repeat(ctx, ggml_sum(ctx, states), out), out);
+        ggml_set_name(chk, "out_chk");
+        return chk;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I32) {
+                std::vector<int32_t> rows(ggml_nelements(t));
+                for (int64_t i = 0; i < (int64_t) rows.size(); ++i) {
+                    // live row, or a rollback plane row when requested
+                    rows[i] = rollback_read && K > 1 ? (int32_t) (mem_size + kv_head + i)
+                                                     : (int32_t) (kv_head + i);
+                }
+                ggml_backend_tensor_set(t, rows.data(), 0, rows.size()*sizeof(int32_t));
+            } else {
+                init_tensor_uniform(t, -0.35f, 0.35f); // keep the recurrence numerically tame
+            }
+        }
+    }
+};
+
 struct test_gated_delta_net : public test_case {
     const ggml_type type;
 
@@ -10251,6 +10310,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1, 1));
+    test_cases.emplace_back(new test_gated_delta_net_zc(4, 32, 1, 1, 1, 2, 0, false));  // plain decode
+    test_cases.emplace_back(new test_gated_delta_net_zc(4, 32, 1, 1, 7, 2, 0, false));  // spec decode T=1
+    test_cases.emplace_back(new test_gated_delta_net_zc(4, 32, 7, 1, 7, 2, 0, false));  // verify batch T=7
+    test_cases.emplace_back(new test_gated_delta_net_zc(4, 32, 3, 1, 7, 2, 0, false));  // partial slots T<K
+    test_cases.emplace_back(new test_gated_delta_net_zc(4, 32, 1, 1, 7, 2, 0, true));   // rollback-plane read
+    test_cases.emplace_back(new test_gated_delta_net_zc(4, 32, 4, 2, 7, 3, 1, false));  // multi-seq, offset head
+    test_cases.emplace_back(new test_gated_delta_net_zc(32, 128, 8, 1, 7, 1, 0, false)); // FN-shaped
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1, 1, true, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1, 1, false, true));

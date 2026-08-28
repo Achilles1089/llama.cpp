@@ -999,6 +999,10 @@ typedef struct {
     uint64_t nb1;
     uint64_t nb2;
     uint64_t nb3;
+    int32_t  zc;          // 1 = state read/write goes straight to the cache
+    int32_t  zc_kv_head;
+    int32_t  zc_mem_size;
+    uint64_t zc_nb1;      // cache row stride in bytes
 } ggml_metal_kargs_gated_delta_net;
 
 typedef struct {
