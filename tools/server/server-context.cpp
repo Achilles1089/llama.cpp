@@ -1035,6 +1035,7 @@ private:
 
     // Necessary similarity of prompt for slot selection
     float slot_prompt_similarity = 0.0f;
+    int64_t slot_pack_idle_us = 300LL * 1000000; // [forge] LLAMA_SLOT_PACK_IDLE_S (s), 0 = off
 
     std::string model_name; // name of the loaded model, to be used by API
     std::set<std::string> model_aliases; // additional names for the model
@@ -1346,6 +1347,13 @@ private:
 
         // Necessary similarity of prompt for slot selection
         slot_prompt_similarity = params_base.slot_prompt_similarity;
+        if (const char * e = getenv("LLAMA_SLOT_PACK_IDLE_S")) {
+            const double v = atof(e);
+            slot_pack_idle_us = (std::isfinite(v) && v > 0) ? (int64_t) (std::min(v, 1e9) * 1e6) : 0;
+        }
+        if (params_base.kv_unified || params_base.n_parallel <= 1) {
+            slot_pack_idle_us = 0; // unified KV batches any slot ids together; one slot has nothing to pack
+        }
 
         const int n_ctx_train = llama_model_n_ctx_train(model_tgt);
 
@@ -1689,6 +1697,8 @@ private:
         server_slot * ret = nullptr;
 
         bool update_cache = false;
+        float ret_f_keep = 0.0f;
+        size_t ret_lcp = 0;
 
         // if a specific slot is requested, use it (still goes through cache update logic below)
         if (task.id_slot != -1) {
@@ -1735,6 +1745,7 @@ private:
                 // select the current slot if the criteria match
                 if (f_sim_cur > f_sim_best && f_sim_cur > slot_prompt_similarity) {
                     f_sim_best = f_sim_cur;
+                    ret_lcp = lcp_len;
 
                     ret = &slot;
                 }
@@ -1742,6 +1753,7 @@ private:
 
             if (ret != nullptr) {
                 const float f_keep = (f_sim_best*task.tokens.size()) / ret->prompt.tokens.size();
+                ret_f_keep = f_keep;
 
                 if (task.id_slot == -1) {
                     SLT_INF(*ret, "selected slot by LCP similarity, f_sim_best = %.3f (> %.3f thold), f_keep = %.3f\n",
@@ -1751,6 +1763,65 @@ private:
                 // if we are about to lose a large portion of the existing context - save it in the prompt cache
                 if (f_keep < 0.5f) {
                     update_cache = true;
+                }
+            }
+        }
+
+        // [forge] pack. With per-slot KV (-np N, not unified) a ubatch only holds CONSECUTIVE slot ids, so
+        // scattered active slots decode as separate forward passes (4 agents on an M1 Max: 17.2 tok/s each on
+        // slots 0-1-2-3, 8.9 on 0-5-10-15). A warm slot (used within LLAMA_SLOT_PACK_IDLE_S) belongs to a live
+        // conversation, e.g. an agent in a tool call. The similarity pick is kept only when it continues its
+        // slot: a warm slot must have its whole previous prompt extended (a straggler that only shares the
+        // system prompt diverges inside it); a cold one must keep at least half. Otherwise the request takes
+        // the free slot that is not warm and not pinned (id_slot) and leaves the fewest consecutive runs over
+        // the busy + warm slots; ties go to an empty slot, then the lowest id. Nothing eligible: upstream.
+        if (task.id_slot == -1 && slot_pack_idle_us > 0) {
+            const int64_t t_now = ggml_time_us();
+            const auto is_warm = [&](const server_slot & s) {
+                return !s.prompt.tokens.empty() && t_now - s.t_last_used < slot_pack_idle_us;
+            };
+            bool keep_pick = false;
+            if (ret != nullptr) {
+                if (is_warm(*ret)) {
+                    const size_t n_prev = ret->task_prev ? (size_t) ret->task_prev->n_tokens() : ret->prompt.tokens.size();
+                    keep_pick = ret_lcp + 16 >= n_prev;
+                } else {
+                    keep_pick = ret_f_keep >= 0.5f;
+                }
+            }
+            if (!keep_pick) {
+                const int n = (int) slots.size();
+                std::vector<char> occ(n, 0);
+                for (const server_slot & s : slots) {
+                    occ[s.id] = s.is_processing() || is_warm(s);
+                }
+                server_slot * best = nullptr;
+                int  best_runs  = n + 1;
+                bool best_empty = false;
+                for (server_slot & s : slots) {
+                    if (occ[s.id]) {
+                        continue;
+                    }
+                    if (!s.prompt.tokens.empty() && s.task_prev && s.task_prev->id_slot != -1) {
+                        continue; // a pinned conversation waits for its owner
+                    }
+                    occ[s.id] = 1;
+                    int runs = 0;
+                    for (int i = 0; i < n; ++i) {
+                        runs += occ[i] && (i == 0 || !occ[i - 1]);
+                    }
+                    occ[s.id] = 0;
+                    const bool empty = s.prompt.tokens.empty();
+                    if (runs < best_runs || (runs == best_runs && empty && !best_empty)) {
+                        best       = &s;
+                        best_runs  = runs;
+                        best_empty = empty;
+                    }
+                }
+                if (best != nullptr) {
+                    ret = best;
+                    update_cache = true;
+                    SLT_INF(*ret, "selected slot by pack, runs = %d, empty = %d\n", best_runs, (int) best_empty);
                 }
             }
         }
@@ -3000,6 +3071,7 @@ private:
 
                         slot->prompt.clear();
                         slot->prompt.tokens = std::move(restored);
+                        slot->t_last_used = ggml_time_us(); // [forge] a restored conversation is warm
                     } catch (const std::exception & err) {
                         slot->prompt_clear();
                         send_error(task, std::string("Unable to restore slot: ") + err.what(), ERROR_TYPE_INVALID_REQUEST);
