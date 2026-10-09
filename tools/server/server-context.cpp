@@ -1517,12 +1517,22 @@ private:
 
         bool update_cache = false;
 
+        server_slot * pinned = nullptr;
+
         // if a specific slot is requested, use it (still goes through cache update logic below)
         if (task.id_slot != -1) {
-            ret = get_slot_by_id(task.id_slot);
-            if (ret) {
-                SLT_INF(*ret, "selected slot by id (%d)\n", task.id_slot);
+            pinned = get_slot_by_id(task.id_slot);
+            if (pinned) {
+                // the pinned slot is still serving another task: return it untouched so the caller defers
+                // this task. the prompt cache update below would save/load/clear the prompt of the slot,
+                // i.e. destroy the KV cache of the request in flight
+                if (pinned->is_processing()) {
+                    SLT_DBG(*pinned, "pinned slot is busy, task %d will wait\n", task.id);
+                    return pinned;
+                }
+                SLT_INF(*pinned, "selected slot by id (%d)\n", task.id_slot);
             }
+            ret = pinned;
         }
 
         // find the slot that has at least n% prompt similarity
@@ -1530,7 +1540,8 @@ private:
             float f_sim_best = 0;
 
             for (server_slot & slot : slots) {
-                if (task.id_slot != -1 && slot.id != task.id_slot) {
+                // compare with the resolved slot, get_slot_by_id() wraps the requested id around
+                if (task.id_slot != -1 && &slot != pinned) {
                     continue;
                 }
 
