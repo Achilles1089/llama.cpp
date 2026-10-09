@@ -2764,6 +2764,144 @@ private:
         return n_read;
     }
 
+    // the draft context (draft model / MTP head KV) is saved next to the slot file, in "<slot file>.draft"
+    // the slot file holds the target context only, so a restored slot used to draft on whatever the draft
+    // context held for that sequence before (ref: https://github.com/ggml-org/llama.cpp/issues/28619)
+    // the sidecar is stamped with a hash of the saved tokens, so it is only loaded with its own slot file
+    static constexpr uint32_t SLOT_DRAFT_MAGIC   = 0x54464453; // "SDFT"
+    static constexpr uint32_t SLOT_DRAFT_VERSION = 1;
+
+    static std::string slot_draft_path(const std::string & filepath) {
+        return filepath + ".draft";
+    }
+
+    // FNV-1a over the packed token payload of the slot file
+    static uint64_t slot_tokens_hash(const void * data, size_t size) {
+        uint64_t h = 0xcbf29ce484222325ULL;
+        const uint8_t * p = (const uint8_t *) data;
+        for (size_t i = 0; i < size; ++i) {
+            h ^= p[i];
+            h *= 0x100000001b3ULL;
+        }
+        return h;
+    }
+
+    // returns the number of bytes written, 0 if there is no draft context or the sidecar could not be written
+    size_t save_slot_draft(const std::string & filepath, const server_slot & slot, uint64_t tokens_hash, uint64_t n_packed) const {
+        if (ctx_dft == nullptr) {
+            return 0;
+        }
+        const std::string path = slot_draft_path(filepath);
+
+        std::vector<uint8_t> data_dft(llama_state_seq_get_size_ext(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE));
+        if (!data_dft.empty() &&
+            llama_state_seq_get_data_ext(ctx_dft, data_dft.data(), data_dft.size(), slot.id, LLAMA_STATE_SEQ_FLAGS_NONE) != data_dft.size()) {
+            SLT_WRN(slot, "failed to read the draft context state - '%s' not written\n", path.c_str());
+            return 0;
+        }
+
+        // speculative state kept outside of the draft context (empty for implementations without one)
+        std::vector<uint8_t> data_spec;
+        common_speculative_get_state(spec.get(), slot.id, data_spec);
+
+        size_t n_written = 0;
+        {
+            std::ofstream ofs(std::filesystem::u8path(path), std::ios::binary | std::ios::trunc);
+            if (ofs) {
+                const uint32_t magic   = SLOT_DRAFT_MAGIC;
+                const uint32_t version = SLOT_DRAFT_VERSION;
+                ckpt_write(ofs, &magic,       sizeof(magic),       n_written);
+                ckpt_write(ofs, &version,     sizeof(version),     n_written);
+                ckpt_write(ofs, &tokens_hash, sizeof(tokens_hash), n_written);
+                ckpt_write(ofs, &n_packed,    sizeof(n_packed),    n_written);
+                ckpt_write_buf(ofs, data_dft,  n_written);
+                ckpt_write_buf(ofs, data_spec, n_written);
+                ofs.flush();
+            }
+            if (!ofs) {
+                n_written = 0;
+            }
+        }
+        if (n_written == 0) {
+            // an incomplete sidecar is rejected on restore anyway, do not leave it behind
+            std::error_code ec;
+            std::filesystem::remove(std::filesystem::u8path(path), ec);
+            SLT_WRN(slot, "failed to write the draft context to '%s' - a restore will start the draft context empty\n", path.c_str());
+            return 0;
+        }
+        SLT_INF(slot, "saved the draft context (%.3f MiB, speculative state %zu bytes) to '%s'\n",
+                (float) data_dft.size() / 1024 / 1024, data_spec.size(), path.c_str());
+        return n_written;
+    }
+
+    size_t load_slot_draft_fallback(const server_slot & slot, const std::string & path, const char * why) {
+        llama_memory_seq_rm(llama_get_memory(ctx_dft), slot.id, -1, -1);
+        SLT_WRN(slot, "draft context not restored (%s: '%s') - the draft context starts empty\n", why, path.c_str());
+        return 0;
+    }
+
+    // restores the draft context of the slot from the sidecar of a slot file, never fails the restore:
+    // a missing or mismatched sidecar leaves the draft context of the sequence empty, with a warning
+    // (it may otherwise hold the state of another conversation)
+    size_t load_slot_draft(const std::string & filepath, server_slot & slot, uint64_t tokens_hash, uint64_t n_packed) {
+        if (ctx_dft == nullptr) {
+            return 0;
+        }
+        const std::string path = slot_draft_path(filepath);
+
+        auto fallback = [&](const char * why) -> size_t {
+            return load_slot_draft_fallback(slot, path, why);
+        };
+
+        std::ifstream ifs(std::filesystem::u8path(path), std::ios::binary | std::ios::ate);
+        if (!ifs) {
+            return fallback("no sidecar file");
+        }
+        const size_t file_size = (size_t) ifs.tellg();
+        if (!ifs.seekg(0)) {
+            return fallback("unreadable sidecar file");
+        }
+
+        size_t n_read = 0;
+        uint32_t magic   = 0;
+        uint32_t version = 0;
+        uint64_t hash    = 0;
+        uint64_t n_tok   = 0;
+        std::vector<uint8_t> data_dft;
+        std::vector<uint8_t> data_spec;
+        if (!ckpt_read(ifs, &magic,   sizeof(magic),   n_read) || magic   != SLOT_DRAFT_MAGIC ||
+            !ckpt_read(ifs, &version, sizeof(version), n_read) || version != SLOT_DRAFT_VERSION) {
+            return fallback("invalid sidecar header");
+        }
+        if (!ckpt_read(ifs, &hash,  sizeof(hash),  n_read) ||
+            !ckpt_read(ifs, &n_tok, sizeof(n_tok), n_read)) {
+            return fallback("truncated sidecar");
+        }
+        if (hash != tokens_hash || n_tok != n_packed) {
+            return fallback("sidecar belongs to another save of this file");
+        }
+        if (!ckpt_read_buf(ifs, data_dft,  file_size, n_read) ||
+            !ckpt_read_buf(ifs, data_spec, file_size, n_read)) {
+            return fallback("truncated sidecar");
+        }
+        if (data_dft.empty()) {
+            return fallback("empty draft state");
+        }
+
+        const size_t n = llama_state_seq_set_data_ext(ctx_dft, data_dft.data(), data_dft.size(), slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        if (n != data_dft.size()) {
+            return fallback("draft state does not match the draft context");
+        }
+        if (!data_spec.empty()) {
+            common_speculative_set_state(spec.get(), slot.id, data_spec);
+        }
+
+        SLT_INF(slot, "restored the draft context (%.3f MiB, pos_max = %d, speculative state %zu bytes) from '%s'\n",
+                (float) data_dft.size() / 1024 / 1024,
+                (int) llama_memory_seq_pos_max(llama_get_memory(ctx_dft), slot.id), data_spec.size(), path.c_str());
+        return n_read;
+    }
+
     // returns false to decline the task, it is offered again after the decode is done
     bool process_single_task(server_task && task, bool is_yielding) {
         // while yielding, an encode / decode is running and only reading the server state is safe
@@ -2979,6 +3117,10 @@ private:
                         break;
                     }
 
+                    // the draft context goes to its own sidecar file, a failure there only costs the draft its warm start
+                    save_slot_draft(filepath, *slot,
+                            slot_tokens_hash(packed.data(), packed.size()), packed.size() / sizeof(llama_token));
+
                     const int64_t t_end = ggml_time_us();
                     const double t_save_ms = (t_end - t_start) / 1000.0;
 
@@ -3013,6 +3155,8 @@ private:
                     std::string filepath = task.slot_action.filepath;
 
                     size_t nread = 0;
+                    uint64_t draft_tokens_hash = 0;
+                    uint64_t draft_n_packed    = 0;
                     try {
                         size_t n_packed = 0;
                         llama_tokens packed;
@@ -3025,6 +3169,9 @@ private:
                             throw std::runtime_error("No available space in KV cache or invalid slot save file");
                         }
                         packed.resize(n_packed);
+
+                        draft_tokens_hash = slot_tokens_hash(packed.data(), packed.size() * sizeof(llama_token));
+                        draft_n_packed    = packed.size();
 
                         server_tokens restored = server_tokens::deserialize(packed, mctx != nullptr);
 
@@ -3046,6 +3193,9 @@ private:
 
                     // nread is the end offset of the llama state payload within the file
                     const size_t nread_ckpt = load_slot_checkpoints(filepath, nread, *slot);
+
+                    // after the checkpoints: their draft test-load clears the draft sequence
+                    load_slot_draft(filepath, *slot, draft_tokens_hash, draft_n_packed);
 
                     const int64_t t_end = ggml_time_us();
                     const double t_restore_ms = (t_end - t_start) / 1000.0;
