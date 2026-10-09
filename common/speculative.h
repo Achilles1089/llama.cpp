@@ -99,6 +99,9 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id, uint16_t
 bool common_speculative_get_state(common_speculative * spec, llama_seq_id seq_id, std::vector<uint8_t> & data);
 void common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id, const std::vector<uint8_t> & data);
 
+// reset the internal per-seq state to its initial value (e.g. when the sequence is replaced by a restored one)
+void common_speculative_reset_state(common_speculative * spec, llama_seq_id seq_id);
+
 // print statistics about the speculative decoding
 void common_speculative_print_stats(const common_speculative * spec);
 
