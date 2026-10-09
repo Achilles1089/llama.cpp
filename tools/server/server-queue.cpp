@@ -87,32 +87,18 @@ int server_queue::get_new_id() {
     return new_id;
 }
 
-void server_queue::pop_deferred_task(int id_slot) {
+void server_queue::pop_deferred_tasks() {
     std::unique_lock<std::mutex> lock(mutex_tasks);
+    // move every deferred task back to the front of the main queue, in their original order: a freed slot
+    // can serve any of them, and each task that still cannot run is deferred again (to the back, so the
+    // order is kept). moving only one task loses the wake-up whenever that task cannot use the freed slot
+    // (pinned to another busy slot, needs more free slots, or the slot is reserved), while a task behind
+    // it could - and a slot action must not be overtaken by a later task pinned to the same slot
     if (!queue_tasks_deferred.empty()) {
-        // try to find a task that uses the specified slot
-        bool found = false;
-        for (auto it = queue_tasks_deferred.begin(); it != queue_tasks_deferred.end(); ++it) {
-            if (it->id_slot == id_slot) {
-                QUE_DBG("pop deferred task (use slot %d), id_task = %d\n", id_slot, it->id);
-                queue_tasks.emplace_front(std::move(*it));
-                queue_tasks_deferred.erase(it);
-                found = true;
-                break;
-            }
-        }
-        // if not tasks found using the slot, pop the first deferred task that is not pinned to another
-        // slot - a task pinned to a busy slot would only be deferred again while the freed slot stays idle
-        // (fall back to the first deferred task, the default behavior)
-        if (!found) {
-            auto it = std::find_if(queue_tasks_deferred.begin(), queue_tasks_deferred.end(),
-                    [](const server_task & task) { return task.id_slot == -1; });
-            if (it == queue_tasks_deferred.end()) {
-                it = queue_tasks_deferred.begin();
-            }
-            QUE_DBG("pop deferred task, id_task = %d\n", it->id);
-            queue_tasks.emplace_front(std::move(*it));
-            queue_tasks_deferred.erase(it);
+        QUE_DBG("pop %zu deferred task(s)\n", queue_tasks_deferred.size());
+        while (!queue_tasks_deferred.empty()) {
+            queue_tasks.push_front(std::move(queue_tasks_deferred.back()));
+            queue_tasks_deferred.pop_back();
         }
     }
     time_last_task = ggml_time_ms();
