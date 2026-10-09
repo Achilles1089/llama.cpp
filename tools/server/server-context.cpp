@@ -17,6 +17,8 @@
 #include "mtmd.h"
 #include "mtmd-helper.h"
 
+#include "hash/xxhash/xxhash.h"
+
 #include <algorithm>
 #include <cstddef>
 #include <cinttypes>
@@ -2498,9 +2500,11 @@ private:
     // the draft context (draft model / MTP head KV) is saved next to the slot file, in "<slot file>.draft"
     // the slot file holds the target context only, so a restored slot used to draft on whatever the draft
     // context held for that sequence before (ref: https://github.com/ggml-org/llama.cpp/issues/28619)
-    // the sidecar is stamped with a hash of the saved tokens, so it is only loaded with its own slot file
+    // the sidecar is stamped with a hash of the saved tokens, so it is only loaded with its own slot file,
+    // and holds a checksum of its payload, so a damaged sidecar is never loaded into the draft context
+    // (the draft state is not validated by llama_state_seq_set_data_ext beyond its layout)
     static constexpr uint32_t SLOT_DRAFT_MAGIC   = 0x54464453; // "SDFT"
-    static constexpr uint32_t SLOT_DRAFT_VERSION = 1;
+    static constexpr uint32_t SLOT_DRAFT_VERSION = 2;           // 2: payload checksum in the header
 
     static std::string slot_draft_path(const std::string & filepath) {
         return filepath + ".draft";
@@ -2514,6 +2518,14 @@ private:
             h ^= p[i];
             h *= 0x100000001b3ULL;
         }
+        return h;
+    }
+
+    // XXH3 of the sidecar payload: each blob chained through the seed, with its size mixed in, so that bytes
+    // cannot move from one blob to the other unnoticed
+    static uint64_t slot_draft_payload_hash(const std::vector<uint8_t> & data_dft, const std::vector<uint8_t> & data_spec) {
+        uint64_t h = XXH3_64bits_withSeed(data_dft.data(),  data_dft.size(),  (uint64_t) data_dft.size());
+        h          = XXH3_64bits_withSeed(data_spec.data(), data_spec.size(), h ^ (uint64_t) data_spec.size());
         return h;
     }
 
@@ -2535,16 +2547,19 @@ private:
         std::vector<uint8_t> data_spec;
         common_speculative_get_state(spec.get(), slot.id, data_spec);
 
+        const uint64_t payload_hash = slot_draft_payload_hash(data_dft, data_spec);
+
         size_t n_written = 0;
         {
             std::ofstream ofs(std::filesystem::u8path(path), std::ios::binary | std::ios::trunc);
             if (ofs) {
                 const uint32_t magic   = SLOT_DRAFT_MAGIC;
                 const uint32_t version = SLOT_DRAFT_VERSION;
-                ckpt_write(ofs, &magic,       sizeof(magic),       n_written);
-                ckpt_write(ofs, &version,     sizeof(version),     n_written);
-                ckpt_write(ofs, &tokens_hash, sizeof(tokens_hash), n_written);
-                ckpt_write(ofs, &n_packed,    sizeof(n_packed),    n_written);
+                ckpt_write(ofs, &magic,        sizeof(magic),        n_written);
+                ckpt_write(ofs, &version,      sizeof(version),      n_written);
+                ckpt_write(ofs, &tokens_hash,  sizeof(tokens_hash),  n_written);
+                ckpt_write(ofs, &n_packed,     sizeof(n_packed),     n_written);
+                ckpt_write(ofs, &payload_hash, sizeof(payload_hash), n_written);
                 ckpt_write_buf(ofs, data_dft,  n_written);
                 ckpt_write_buf(ofs, data_spec, n_written);
                 ofs.flush();
@@ -2603,14 +2618,19 @@ private:
         uint32_t version = 0;
         uint64_t hash    = 0;
         uint64_t n_tok   = 0;
+        uint64_t payload_hash = 0;
         std::vector<uint8_t> data_dft;
         std::vector<uint8_t> data_spec;
         if (!ckpt_read(ifs, &magic,   sizeof(magic),   n_read) || magic   != SLOT_DRAFT_MAGIC ||
-            !ckpt_read(ifs, &version, sizeof(version), n_read) || version != SLOT_DRAFT_VERSION) {
+            !ckpt_read(ifs, &version, sizeof(version), n_read)) {
             return fallback("invalid sidecar header");
         }
-        if (!ckpt_read(ifs, &hash,  sizeof(hash),  n_read) ||
-            !ckpt_read(ifs, &n_tok, sizeof(n_tok), n_read)) {
+        if (version != SLOT_DRAFT_VERSION) {
+            return fallback("unsupported sidecar version");
+        }
+        if (!ckpt_read(ifs, &hash,         sizeof(hash),         n_read) ||
+            !ckpt_read(ifs, &n_tok,        sizeof(n_tok),        n_read) ||
+            !ckpt_read(ifs, &payload_hash, sizeof(payload_hash), n_read)) {
             return fallback("truncated sidecar");
         }
         if (hash != tokens_hash || n_tok != n_packed) {
@@ -2619,6 +2639,9 @@ private:
         if (!ckpt_read_buf(ifs, data_dft,  file_size, n_read) ||
             !ckpt_read_buf(ifs, data_spec, file_size, n_read)) {
             return fallback("truncated sidecar");
+        }
+        if (slot_draft_payload_hash(data_dft, data_spec) != payload_hash) {
+            return fallback("checksum mismatch, the sidecar is damaged");
         }
         if (data_dft.empty()) {
             return fallback("empty draft state");
