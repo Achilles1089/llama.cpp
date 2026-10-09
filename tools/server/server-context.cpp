@@ -1507,9 +1507,8 @@ private:
     }
 
     server_slot * get_slot_by_id(int id_slot) {
-        // note: allow id_slot to be out of bounds (wrap around)
-        id_slot = id_slot % slots.size();
-
+        // note: no wrap-around - the API rejects an id_slot out of range, so that a task pinned to a slot
+        // always names that slot by its own id
         for (server_slot & slot : slots) {
             if (slot.id == id_slot) {
                 return &slot;
@@ -1561,7 +1560,7 @@ private:
             float f_sim_best = 0;
 
             for (server_slot & slot : slots) {
-                // compare with the resolved slot, get_slot_by_id() wraps the requested id around
+                // a pinned task only considers its own slot
                 if (task.id_slot != -1 && &slot != pinned) {
                     continue;
                 }
@@ -4610,6 +4609,12 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             task.id_slot = json_value(data, "id_slot", -1);
             sse_ping_interval = task.params.sse_ping_interval;
 
+            if (task.id_slot < -1 || task.id_slot >= params.n_parallel) {
+                throw std::invalid_argument(string_format(
+                        "Invalid id_slot %d: the server has %d slots (0 to %d), -1 = any slot",
+                        task.id_slot, params.n_parallel, params.n_parallel - 1));
+            }
+
             // with --reserve-slot, a task not pinned to the reserved slot runs itself and its n_cmpl - 1 child
             // tasks on the other n_parallel - 1 slots (child tasks never use the reserved slot) - asking for
             // more would leave the task deferred forever, and the tasks queued behind it with it
@@ -5080,6 +5085,11 @@ void server_routes::init_routes() {
             id_slot = std::stoi(id_slot_str);
         } catch (const std::exception &) {
             res->error(format_error_response("Invalid slot ID", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        if (id_slot < 0 || id_slot >= params.n_parallel) {
+            res->error(format_error_response(string_format("Invalid slot ID %d: the server has %d slots (0 to %d)",
+                    id_slot, params.n_parallel, params.n_parallel - 1), ERROR_TYPE_INVALID_REQUEST));
             return res;
         }
 
