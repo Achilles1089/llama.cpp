@@ -101,11 +101,18 @@ void server_queue::pop_deferred_task(int id_slot) {
                 break;
             }
         }
-        // if not tasks found using the slot, just pop the first deferred task (default behavior)
+        // if not tasks found using the slot, pop the first deferred task that is not pinned to another
+        // slot - a task pinned to a busy slot would only be deferred again while the freed slot stays idle
+        // (fall back to the first deferred task, the default behavior)
         if (!found) {
-            QUE_DBG("pop deferred task, id_task = %d\n", queue_tasks_deferred.front().id);
-            queue_tasks.emplace_front(std::move(queue_tasks_deferred.front()));
-            queue_tasks_deferred.pop_front();
+            auto it = std::find_if(queue_tasks_deferred.begin(), queue_tasks_deferred.end(),
+                    [](const server_task & task) { return task.id_slot == -1; });
+            if (it == queue_tasks_deferred.end()) {
+                it = queue_tasks_deferred.begin();
+            }
+            QUE_DBG("pop deferred task, id_task = %d\n", it->id);
+            queue_tasks.emplace_front(std::move(*it));
+            queue_tasks_deferred.erase(it);
         }
     }
     time_last_task = ggml_time_ms();

@@ -927,6 +927,9 @@ private:
     // Necessary similarity of prompt for slot selection
     float slot_prompt_similarity = 0.0f;
 
+    // --reserve-slot: only tasks pinned to this slot with id_slot may use it (-1 = off)
+    int reserve_slot = -1;
+
     std::string model_name; // name of the loaded model, to be used by API
     std::set<std::string> model_aliases; // additional names for the model
     std::set<std::string> model_tags;    // informational tags
@@ -1292,6 +1295,24 @@ private:
             slot.reset();
         }
 
+        reserve_slot = params_base.reserve_slot;
+        if (reserve_slot >= 0) {
+            // with a single slot, unpinned tasks would wait forever
+            if (params_base.n_parallel < 2 || reserve_slot >= params_base.n_parallel) {
+                SRV_ERR("--reserve-slot %d needs a valid slot id and at least 2 slots (n_slots = %d)\n",
+                        reserve_slot, params_base.n_parallel);
+                return false;
+            }
+            if (!is_resume) {
+                SRV_INF("slot %d is reserved: only requests with id_slot = %d use it, other requests wait for another slot\n",
+                        reserve_slot, reserve_slot);
+                if (params_base.kv_unified) {
+                    SRV_WRN("unified KV cache: idle slot clearing (--cache-idle-slots, full KV cache) can still clear the reserved slot %d\n",
+                            reserve_slot);
+                }
+            }
+        }
+
         {
             const char * LLAMA_TRACE = getenv("LLAMA_TRACE");
             trace = LLAMA_TRACE ? atoi(LLAMA_TRACE) : 0;
@@ -1545,6 +1566,11 @@ private:
                     continue;
                 }
 
+                // the reserved slot is only for tasks pinned to it
+                if (slot.id == reserve_slot && &slot != pinned) {
+                    continue;
+                }
+
                 // skip the slot if it is not available
                 if (slot.is_processing()) {
                     SLT_TRC(slot, " - skipping, is_processing = %d\n", slot.is_processing());
@@ -1595,6 +1621,11 @@ private:
             for (server_slot & slot : slots) {
                 // skip the slot if it is not available
                 if (slot.is_processing()) {
+                    continue;
+                }
+
+                // the reserved slot is only for tasks pinned to it - an unpinned task waits for another slot
+                if (slot.id == reserve_slot) {
                     continue;
                 }
 
@@ -2229,7 +2260,8 @@ private:
     std::vector<server_slot *> get_free_slots(size_t n_slots_needed, int exclude_id_slot) {
         std::vector<server_slot *> free_slots;
         for (auto & slot : slots) {
-            if (!slot.is_processing() && slot.id != exclude_id_slot) {
+            // child tasks cannot be pinned, so they never use the reserved slot
+            if (!slot.is_processing() && slot.id != exclude_id_slot && slot.id != reserve_slot) {
                 free_slots.push_back(&slot);
             }
             if (free_slots.size() >= n_slots_needed) {

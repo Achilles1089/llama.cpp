@@ -3800,6 +3800,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--reserve-slot"}, "N",
+        string_format("reserve slot N for requests pinned to it with id_slot: requests without id_slot never use it "
+            "and wait for another slot instead (default: %d, -1 = disabled)", params.reserve_slot),
+        [](common_params & params, int value) {
+            if (value < -1) {
+                throw std::invalid_argument("--reserve-slot must be -1 (disabled) or a slot id");
+            }
+            params.reserve_slot = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_RESERVE_SLOT"));
+    add_opt(common_arg(
         {"--lora-init-without-apply"},
         string_format("load LoRA adapters without applying them (apply later via POST /lora-adapters) (default: %s)", params.lora_init_without_apply ? "enabled" : "disabled"),
         [](common_params & params) {
