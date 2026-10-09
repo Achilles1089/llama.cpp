@@ -4610,6 +4610,17 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             task.id_slot = json_value(data, "id_slot", -1);
             sse_ping_interval = task.params.sse_ping_interval;
 
+            // with --reserve-slot, a task not pinned to the reserved slot runs itself and its n_cmpl - 1 child
+            // tasks on the other n_parallel - 1 slots (child tasks never use the reserved slot) - asking for
+            // more would leave the task deferred forever, and the tasks queued behind it with it
+            if (params.reserve_slot >= 0 && task.id_slot != params.reserve_slot && task.params.n_cmpl > params.n_parallel - 1) {
+                throw std::invalid_argument(string_format(
+                        "n_cmpl = %d needs %d free slots, but slot %d is reserved (--reserve-slot): a request not pinned "
+                        "to it with id_slot = %d can use at most %d of the %d slots",
+                        task.params.n_cmpl, task.params.n_cmpl, params.reserve_slot, params.reserve_slot,
+                        params.n_parallel - 1, params.n_parallel));
+            }
+
             // OAI-compat
             task.params.res_type          = res_type;
             task.params.oaicompat_cmpl_id = completion_id;
