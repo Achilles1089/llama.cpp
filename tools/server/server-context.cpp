@@ -2575,6 +2575,11 @@ private:
     // a missing or mismatched sidecar leaves the draft context of the sequence empty, with a warning
     // (it may otherwise hold the state of another conversation)
     size_t load_slot_draft(const std::string & filepath, server_slot & slot, uint64_t tokens_hash, uint64_t n_packed) {
+        // the speculative state kept outside of the draft context (e.g. the MTP h-row carried over to the next
+        // batch) still belongs to the conversation the slot held before - reset it first, so that every path
+        // below, restored or fallback, starts from the saved state or from the initial one
+        common_speculative_reset_state(spec.get(), slot.id);
+
         if (ctx_dft == nullptr) {
             return 0;
         }
@@ -2623,6 +2628,7 @@ private:
         if (n != data_dft.size()) {
             return fallback("draft state does not match the draft context");
         }
+        // an empty speculative state was saved as "no state": the reset above already matches it
         if (!data_spec.empty()) {
             common_speculative_set_state(spec.get(), slot.id, data_spec);
         }
