@@ -1281,8 +1281,8 @@ private:
 
             SLT_TRC(slot, "new slot, n_ctx = %d\n", slot.n_ctx);
 
-            slot.callback_on_release = [this](int id_slot) {
-                queue_tasks.pop_deferred_task(id_slot);
+            slot.callback_on_release = [this](int /* id_slot */) {
+                queue_tasks.pop_deferred_tasks();
             };
 
             slot.callback_on_reset = [this](const server_slot & slot) {
@@ -5588,6 +5588,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_save(const ser
     {
         server_task task(SERVER_TASK_TYPE_SLOT_SAVE);
         task.id = rd.get_new_id();
+        task.id_slot              = id_slot; // pinned like a completion, the queue keeps the order of the tasks of a slot
         task.slot_action.id_slot  = id_slot;
         task.slot_action.filename = filename;
         task.slot_action.filepath = filepath;
@@ -5624,6 +5625,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_restore(const 
     {
         server_task task(SERVER_TASK_TYPE_SLOT_RESTORE);
         task.id = rd.get_new_id();
+        task.id_slot              = id_slot; // pinned like a completion, the queue keeps the order of the tasks of a slot
         task.slot_action.id_slot  = id_slot;
         task.slot_action.filename = filename;
         task.slot_action.filepath = filepath;
@@ -5653,6 +5655,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_erase(const se
     {
         server_task task(SERVER_TASK_TYPE_SLOT_ERASE);
         task.id = rd.get_new_id();
+        task.id_slot             = id_slot; // pinned like a completion, the queue keeps the order of the tasks of a slot
         task.slot_action.id_slot = id_slot;
         rd.post_task(std::move(task));
     }
