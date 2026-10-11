@@ -5,6 +5,7 @@
 
 #include <string>
 #include <unordered_set>
+#include <functional>
 #include <list>
 #include <map>
 
@@ -14,6 +15,8 @@
 
 enum server_task_type {
     SERVER_TASK_TYPE_COMPLETION,
+    SERVER_TASK_TYPE_PROMPT_CACHE_GET,     // GET /prompt-cache: the hot set and the disk set (read-only, allowed while decoding)
+    SERVER_TASK_TYPE_PROMPT_CACHE_FLUSH,   // the idle flush: idle slots to the disk tier
     SERVER_TASK_TYPE_EMBEDDING,
     SERVER_TASK_TYPE_RERANK,
     SERVER_TASK_TYPE_DECISION,
@@ -666,6 +669,13 @@ struct server_prompt_cache {
         this->limit_tokens = limit_tokens;
     }
 
+    // why alloc() returned nullptr — the disk tier (server-prompt-disk.h) streams what the RAM tier cannot hold
+    enum alloc_status { ALLOC_OK, ALLOC_CACHED, ALLOC_OVER_LIMIT, ALLOC_NO_HEADROOM, ALLOC_NO_MEMORY };
+
+    // the disk tier takes a state evicted from RAM (it keeps the bytes counted through in_flight until written)
+    std::function<void(server_prompt_cache_state &&, const char *)> on_evict;
+    std::function<size_t()> in_flight;
+
     std::list<server_prompt_cache_state> states;
 
     // in bytes, 0 = no limit
@@ -674,11 +684,15 @@ struct server_prompt_cache {
     // in tokens, 0 = no limit
     size_t limit_tokens = 0;
 
-    size_t size() const;
+    size_t size() const;          // the states, plus what the disk tier has not written yet
+    size_t size_states() const;   // the states alone
 
     size_t n_tokens() const;
 
-    server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
+    server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft, alloc_status * status = nullptr);
+
+    // the oldest state leaves RAM — to the disk tier when there is one
+    void evict_front(const char * why);
 
     // find a cached state that is a better starting point than `prompt` for `tokens_new`
     std::list<server_prompt_cache_state>::iterator find_better(const server_prompt & prompt, const server_tokens & tokens_new);

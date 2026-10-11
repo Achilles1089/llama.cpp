@@ -7,6 +7,7 @@
 #include "server-queue.h"
 #include "server-schema.h"
 #include "server-stream.h"
+#include "server-prompt-disk.h"
 
 #include "build-info.h"
 #include "common.h"
@@ -307,7 +308,10 @@ struct server_slot {
 
     server_prompt prompt;
 
-    bool prompt_save(server_prompt_cache & prompt_cache) const {
+    bool prompt_save(server_prompt_cache & prompt_cache, server_prompt_cache::alloc_status * status = nullptr) const {
+        if (status) {
+            *status = server_prompt_cache::ALLOC_CACHED;
+        }
         if (prompt.tokens.size() == 0) {
             return false;
         }
@@ -320,7 +324,7 @@ struct server_slot {
         SRV_TRC(" - saving prompt with length %d, total state size = %.3f MiB (draft: %.3f MiB)\n",
                 (int) prompt.tokens.size(), cur_size / (1024.0 * 1024.0), cur_size_dft / (1024.0 * 1024.0));
 
-        auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft);
+        auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft, status);
         if (cur == nullptr) {
             return false;
         }
@@ -1025,6 +1029,9 @@ private:
 
     std::unique_ptr<server_prompt_cache> prompt_cache;
 
+    // the disk tier under it (--cache-dir): created once, kept across sleep/wake (the RAM tier is remade on wake)
+    std::unique_ptr<server_prompt_cache_disk> disk;
+
     server_metrics metrics;
 
     // queued prompt stats - llama_decode() is async, so the timing is only valid after a sync
@@ -1073,6 +1080,7 @@ private:
                 // note: for sleeping == false, event is emitted by load_model()
             }
             SRV_INF("%s", "server is entering sleeping state\n");
+            flush_on_exit("sleep");
             destroy();
         } else {
             SRV_INF("%s", "server is exiting sleeping state\n");
@@ -1526,6 +1534,39 @@ private:
         }
         SRV_TRC("%s", "for more info see https://github.com/ggml-org/llama.cpp/pull/16391\n");
 
+        // THE DISK TIER (server-prompt-disk.h): under the RAM prompt cache - states too big for it, or evicted from it,
+        // go to disk; a request whose prompt is on disk restores from there. The index lives for the process: a wake
+        // after sleep remakes the RAM tier but keeps the disk one.
+        if (!params_base.cache_dir.empty()) {
+            if (!prompt_cache) {
+                SRV_WRN("%s", "--cache-dir needs --cache-ram (the disk tier sits under the RAM prompt cache) - disabled\n");
+            } else {
+                if (!disk) {
+                    disk = std::make_unique<server_prompt_cache_disk>(disk_params(), disk_env(), mctx != nullptr);
+                    disk->scan();
+                    disk->on_idle_flush = [this]() {
+                        server_task task(SERVER_TASK_TYPE_PROMPT_CACHE_FLUSH);
+                        task.id = queue_tasks.get_new_id();
+                        queue_tasks.post(std::move(task));
+                    };
+                }
+                prompt_cache->in_flight = [this]() { return disk->in_flight_bytes(); };
+                prompt_cache->on_evict  = [this](server_prompt_cache_state && st, const char * why) {
+                    std::vector<char> packed;
+                    try {
+                        packed = st.prompt.tokens.serialize();
+                    } catch (const std::exception & e) {
+                        SRV_WRN("prompt-cache disk: an evicted state could not be serialized (%s) - dropped\n", e.what());
+                        return;
+                    }
+                    disk->offer(std::move(st), std::move(packed), why);
+                };
+                SRV_INF("prompt-cache disk: on, %s (budget %d MiB, floor %d MiB free, min %d tokens, idle flush %d s)\n",
+                        params_base.cache_dir.c_str(), params_base.cache_dir_max_mib, params_base.cache_dir_free_min_mib,
+                        params_base.cache_dir_min_tokens, params_base.cache_dir_idle_flush_s);
+            }
+        }
+
         if (params_base.n_ctx_checkpoints > 0) {
             SRV_TRC("context checkpoints enabled, max = %d, min spacing = %d\n",
                     params_base.n_ctx_checkpoints, params_base.checkpoint_min_step);
@@ -1821,31 +1862,72 @@ private:
             // cache prompts only for completion tasks
             const bool can_cache = prompt_cache && task.type == SERVER_TASK_TYPE_COMPLETION;
 
+            // the disk tier's best entry for this request, scored against what the slot holds (server-prompt-disk.h)
+            server_prompt_disk_hit disk_hit;
+            const bool disk_better = can_cache && disk && disk->find_better(ret->prompt, task.tokens, ret->n_ctx, disk_hit);
+
             // the checks above only tell if the outgoing state is worth saving
-            // the cache can still hold a better start for this task, so ask it
-            update_cache = can_cache && (update_cache || prompt_cache->has_better(ret->prompt, task.tokens));
+            // the cache can still hold a better start for this task, so ask it - the RAM tier, then the disk tier
+            update_cache = can_cache && (update_cache || prompt_cache->has_better(ret->prompt, task.tokens) || disk_better);
+
+            if (disk) {
+                disk->note_activity();
+                if (ret->id == reserve_slot) {
+                    disk->set_protected(task.tokens.clone());   // the chat in the reserved slot: its states are never evicted
+                }
+                disk->set_held(disk_better ? disk_hit.id : "");  // the entry this request restores: the save below must not evict it
+            }
 
             if (update_cache) {
                 SRV_TRC("%s", "updating prompt cache\n");
 
                 const int64_t t_start = ggml_time_us();
 
-                ret->prompt_save(*prompt_cache);
+                server_prompt_cache::alloc_status st = server_prompt_cache::ALLOC_CACHED;
+                ret->prompt_save(*prompt_cache, &st);
+                if (disk && (st == server_prompt_cache::ALLOC_OVER_LIMIT || st == server_prompt_cache::ALLOC_NO_HEADROOM || st == server_prompt_cache::ALLOC_NO_MEMORY)) {
+                    // too big for a RAM copy, or no room for one: the slot still holds the state - stream it to disk now
+                    flush_slot(*ret, st == server_prompt_cache::ALLOC_OVER_LIMIT ? "over-limit" : "no-headroom", true);
+                }
 
-                if (!ret->prompt_load(*prompt_cache, task.tokens)) {
-                    ret->prompt_clear();
+                bool reset_spec = true;
+                if (prompt_cache->has_better(ret->prompt, task.tokens)) {
+                    if (!ret->prompt_load(*prompt_cache, task.tokens)) {
+                        ret->prompt_clear();
+                    }
+                } else if (disk_better) {
+                    // a RAM miss: the best state on disk, through the slot-file loader (streamed, no host copy)
+                    SLT_INF(*ret, "prompt-cache disk: restoring id=%s (%d tokens, lcp %d, resume %d, f_keep %.3f, f_sim %.3f)\n",
+                            disk_hit.id.c_str(), disk_hit.n_tokens, disk_hit.score.lcp, disk_hit.score.resume,
+                            disk_hit.score.f_keep, disk_hit.score.f_sim);
+                    const int64_t t_r = ggml_time_us();
+                    size_t n_bytes = 0;
+                    std::string err;
+                    if (restore_slot_from_file(*ret, disk_hit.path, n_bytes, err)) {
+                        disk->touch(disk_hit.id);
+                        reset_spec = false;   // load_slot_draft reset and restored it
+                        SLT_INF(*ret, "prompt-cache disk: restored id=%s tokens=%d bytes=%zu t=%.0fms\n",
+                                disk_hit.id.c_str(), disk_hit.n_tokens, n_bytes, (ggml_time_us() - t_r) / 1000.0);
+                    } else {
+                        ret->prompt_clear();
+                        disk->drop(disk_hit.id, ("restore failed: " + err).c_str());
+                    }
                 }
 
                 // the slot's sequence now holds another conversation's state (or none): the draft's per-sequence
-                // speculative state must not pair the previous conversation's last row with the next batch — the
+                // speculative state must not pair the previous conversation's last row with the next batch - the
                 // same reset load_slot_draft does after a file restore
-                if (spec) {
+                if (reset_spec && spec) {
                     common_speculative_reset_state(spec.get(), ret->id);
                 }
 
                 prompt_cache->update();
 
                 SRV_TRC("prompt cache update took %.2f ms\n", (ggml_time_us() - t_start) / 1000.0);
+            }
+
+            if (disk) {
+                disk->set_held("");
             }
         }
 
@@ -2940,9 +3022,236 @@ private:
     }
 
     // returns false to decline the task, it is offered again after the decode is done
+    // ── the disk tier's doors (server-prompt-disk.h) ─────────────────────────────────────────────────────────────
+
+    server_prompt_disk_params disk_params() const {
+        server_prompt_disk_params p;
+        p.dir            = params_base.cache_dir;
+        p.max_bytes      = params_base.cache_dir_max_mib      > 0 ? 1024ull * 1024ull * params_base.cache_dir_max_mib      : 0;
+        p.free_min_bytes = params_base.cache_dir_free_min_mib > 0 ? 1024ull * 1024ull * params_base.cache_dir_free_min_mib : 0;
+        p.min_tokens     = params_base.cache_dir_min_tokens > 0 ? (size_t) params_base.cache_dir_min_tokens : 0;
+        p.idle_flush_s   = params_base.cache_dir_idle_flush_s;
+        return p;
+    }
+
+    // what every manifest must match: a state file is valid only for the build, weights, draft, kv types, context shape
+    // and format versions that made it (llama_state_seq_load_file checks only magic, version and shapes)
+    json disk_env() const {
+        auto finfo = [](const std::string & path) -> json {
+            if (path.empty()) {
+                return nullptr;
+            }
+            std::error_code ec;
+            const auto size  = std::filesystem::file_size(std::filesystem::u8path(path), ec);
+            const auto mtime = ec ? 0 : (int64_t) std::filesystem::last_write_time(std::filesystem::u8path(path), ec).time_since_epoch().count();
+            return {{"path", path}, {"size", ec ? 0 : (uint64_t) size}, {"mtime", mtime}};
+        };
+        json types = json::array();
+        for (auto t : params_base.speculative.types) {
+            types.push_back(common_speculative_type_to_str(t));
+        }
+        const json drafts = finfo(params_base.speculative.draft.mparams.path);
+        return {
+            {"build", llama_build_info()},
+            {"state_seq_version", LLAMA_STATE_SEQ_VERSION},
+            {"ckpt_version", server_slot_file::CKPT_VERSION},
+            {"draft_version", server_slot_file::DRAFT_VERSION},
+            {"model", finfo(params_base.model.path)},
+            {"mmproj", finfo(params_base.mmproj.path)},
+            {"spec", types},
+            {"draft_model", drafts},
+            {"type_k", ggml_type_name(params_base.cache_type_k)},
+            {"type_v", ggml_type_name(params_base.cache_type_v)},
+            {"n_ctx", (int) llama_n_ctx(ctx_tgt)},
+            {"n_ctx_seq", (int) llama_n_ctx_seq(ctx_tgt)},
+            {"n_parallel", params_base.n_parallel},
+            {"n_ctx_checkpoints", params_base.n_ctx_checkpoints},
+            {"checkpoint_min_step", params_base.checkpoint_min_step},
+        };
+    }
+
+    // the slot to a slot file (GGSQ payload, the checkpoint appendix, the draft sidecar) - /slots save, and the tier's
+    // streaming path; `packed` is the serialized prompt (for the tier's id). false with `err` on failure.
+    bool save_slot_to_file(const server_slot & slot, const std::string & filepath, std::vector<char> & packed,
+                           size_t & n_main, size_t & n_ckpt, std::string & err) const {
+        n_main = n_ckpt = 0;
+        try {
+            packed = slot.prompt.tokens.serialize();
+        } catch (const std::exception & e) {
+            err = e.what();
+            return false;
+        }
+        GGML_ASSERT(packed.size() % sizeof(llama_token) == 0);
+        n_main = llama_state_seq_save_file(ctx_tgt, filepath.c_str(), slot.id,
+                                           reinterpret_cast<const llama_token *>(packed.data()), packed.size() / sizeof(llama_token));
+        if (n_main == 0) {
+            err = "Unable to save slot";
+            return false;
+        }
+        if (!save_slot_checkpoints(filepath, slot, n_ckpt)) {
+            err = "Unable to save slot: incomplete context checkpoints";
+            return false;
+        }
+        // the draft context goes to its own sidecar file, a failure there only costs the draft its warm start
+        save_slot_draft(filepath, slot, slot_tokens_hash(packed.data(), packed.size()), packed.size() / sizeof(llama_token));
+        return true;
+    }
+
+    // a slot file into the slot (the payload, then the checkpoints, then the draft) - /slots restore, and the tier's
+    // miss path. On failure the slot is cleared and `err` says why. `n_bytes` = payload + appendix read.
+    bool restore_slot_from_file(server_slot & slot, const std::string & filepath, size_t & n_bytes, std::string & err) {
+        n_bytes = 0;
+        size_t nread = 0;
+        uint64_t draft_tokens_hash = 0;
+        uint64_t draft_n_packed    = 0;
+        try {
+            size_t n_packed = 0;
+            llama_tokens packed;
+            nread = llama_state_seq_load_file(ctx_tgt, filepath.c_str(), slot.id, nullptr, 0, &n_packed);
+            if (nread != 0) {
+                packed.resize(std::max<size_t>(1, n_packed));
+                nread = llama_state_seq_load_file(ctx_tgt, filepath.c_str(), slot.id, packed.data(), packed.size(), &n_packed);
+            }
+            if (nread == 0) {
+                throw std::runtime_error("No available space in KV cache or invalid slot save file");
+            }
+            packed.resize(n_packed);
+
+            draft_tokens_hash = slot_tokens_hash(packed.data(), packed.size() * sizeof(llama_token));
+            draft_n_packed    = packed.size();
+
+            server_tokens restored = server_tokens::deserialize(packed, mctx != nullptr);
+
+            if (restored.size() > (size_t) slot.n_ctx) {
+                throw std::runtime_error("Restored prompt does not fit in the slot context");
+            }
+            if (!restored.validate(ctx_tgt)) {
+                throw std::runtime_error("Invalid tokens in slot save file");
+            }
+
+            slot.prompt.clear();
+            slot.prompt.tokens = std::move(restored);
+        } catch (const std::exception & e) {
+            slot.prompt_clear();
+            err = e.what();
+            return false;
+        }
+        // nread is the end offset of the llama state payload within the file
+        const size_t nread_ckpt = load_slot_checkpoints(filepath, nread, slot);
+        // after the checkpoints: their draft test-load clears the draft sequence
+        load_slot_draft(filepath, slot, draft_tokens_hash, draft_n_packed);
+        n_bytes = nread + nread_ckpt;
+        return true;
+    }
+
+    // THE FLUSH: an idle slot's state to the disk tier - a RAM copy handed to the writer when the RAM tier has room
+    // for one beside what is in flight, else streamed from the slot now (synchronous, this thread). What is already
+    // on disk is only touched. `stream_only`: the state is known not to fit a RAM copy.
+    bool flush_slot(server_slot & slot, const char * why, bool stream_only = false) {
+        if (!disk || slot.is_processing() || slot.prompt.n_tokens() == 0) {
+            return false;
+        }
+        if ((size_t) slot.prompt.n_tokens() < disk->params.min_tokens) {
+            return false;
+        }
+        std::vector<char> packed;
+        try {
+            packed = slot.prompt.tokens.serialize();
+        } catch (const std::exception & e) {
+            SLT_WRN(slot, "prompt-cache disk: not flushed - %s\n", e.what());
+            return false;
+        }
+        const std::string id = server_prompt_cache_disk::id_of(packed);
+        if (disk->contains(id)) {
+            disk->touch(id);
+            SLT_INF(slot, "prompt-cache disk: unchanged id=%s, not rewritten [%s]\n", id.c_str(), why);
+            return true;
+        }
+        if (!stream_only && prompt_cache) {
+            const size_t sz_tgt = llama_state_seq_get_size_ext(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
+            const size_t sz_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
+            size_t sz_ck = 0;
+            for (const auto & c : slot.prompt.checkpoints) {
+                sz_ck += c.size();
+            }
+            const size_t need = sz_tgt + sz_dft + sz_ck;
+            if (prompt_cache->limit_size == 0 || prompt_cache->size() + need <= prompt_cache->limit_size) {
+                server_prompt_cache_state st;
+                bool ok = sz_tgt > 0;
+                if (ok) {
+                    try {
+                        st.data.main.resize(sz_tgt);
+                        st.data.drft.resize(sz_dft);
+                    } catch (const std::bad_alloc &) {
+                        ok = false;
+                    }
+                }
+                if (ok) {
+                    ok = llama_state_seq_get_data_ext(ctx_tgt, st.data.main.data(), sz_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE) == sz_tgt;
+                    if (ok && sz_dft > 0) {
+                        ok = llama_state_seq_get_data_ext(ctx_dft, st.data.drft.data(), sz_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE) == sz_dft;
+                    }
+                }
+                if (ok) {
+                    st.prompt = slot.prompt.clone();
+                    return disk->offer(std::move(st), std::move(packed), why);
+                }
+                // fall through: streamed
+            }
+        }
+        const std::string tmp = disk->path_main(id) + ".tmp";
+        size_t n_main = 0, n_ckpt = 0;
+        std::string err;
+        std::vector<char> packed2;
+        std::error_code ec;
+        if (!save_slot_to_file(slot, tmp, packed2, n_main, n_ckpt, err)) {
+            std::filesystem::remove(std::filesystem::u8path(tmp), ec);
+            std::filesystem::remove(std::filesystem::u8path(slot_draft_path(tmp)), ec);
+            SLT_WRN(slot, "prompt-cache disk: not flushed - %s\n", err.c_str());
+            return false;
+        }
+        std::filesystem::rename(std::filesystem::u8path(tmp), std::filesystem::u8path(disk->path_main(id)), ec);
+        if (ec) {
+            std::filesystem::remove(std::filesystem::u8path(tmp), ec);
+            std::filesystem::remove(std::filesystem::u8path(slot_draft_path(tmp)), ec);
+            SLT_WRN(slot, "prompt-cache disk: could not place %s\n", disk->path_main(id).c_str());
+            return false;
+        }
+        size_t n_draft = 0;
+        if (std::filesystem::exists(std::filesystem::u8path(slot_draft_path(tmp)), ec)) {
+            std::filesystem::rename(std::filesystem::u8path(slot_draft_path(tmp)), std::filesystem::u8path(disk->path_draft(id)), ec);
+            n_draft = ec ? 0 : (size_t) std::filesystem::file_size(std::filesystem::u8path(disk->path_draft(id)), ec);
+        } else {
+            std::filesystem::remove(std::filesystem::u8path(disk->path_draft(id)), ec);
+        }
+        llama_tokens ids(packed.size() / sizeof(llama_token));
+        memcpy(ids.data(), packed.data(), packed.size());
+        disk->add_streamed(id, std::move(ids), n_main, n_main + n_ckpt + n_draft, why);
+        return true;
+    }
+
+    // shutdown and sleep: the reserved slot's state (streamed, skipped when unchanged) and every RAM state go to disk;
+    // the disk tier's destructor drains its writer
+    void flush_on_exit(const char * why) {
+        if (!disk) {
+            return;
+        }
+        SRV_INF("prompt-cache disk: flush on %s\n", why);
+        for (auto & slot : slots) {
+            if (!slot.is_processing() && slot.prompt.n_tokens() > 0 && (reserve_slot < 0 || slot.id == reserve_slot)) {
+                flush_slot(slot, why, true);
+            }
+        }
+        if (prompt_cache) {
+            while (!prompt_cache->states.empty()) {
+                prompt_cache->evict_front(why);
+            }
+        }
+    }
+
     bool process_single_task(server_task && task, bool is_yielding) {
         // while yielding, an encode / decode is running and only reading the server state is safe
-        if (is_yielding && task.type != SERVER_TASK_TYPE_METRICS && task.type != SERVER_TASK_TYPE_SLOT_GET) {
+        if (is_yielding && task.type != SERVER_TASK_TYPE_METRICS && task.type != SERVER_TASK_TYPE_SLOT_GET && task.type != SERVER_TASK_TYPE_PROMPT_CACHE_GET) {
             SRV_DBG("decoding, decline task, id_task = %d\n", task.id);
             return false;
         }
@@ -3111,6 +3420,33 @@ private:
 
                     queue_results.send(std::move(res));
                 } break;
+            case SERVER_TASK_TYPE_PROMPT_CACHE_GET:
+                {
+                    json j = json::object();
+                    if (prompt_cache) {
+                        json ram = json::array();
+                        for (const auto & st : prompt_cache->states) {
+                            ram.push_back({{"n_tokens", st.prompt.n_tokens()}, {"bytes", st.size()}, {"checkpoints", st.prompt.checkpoints.size()}});
+                        }
+                        j["ram"] = {{"entries", ram}, {"bytes", prompt_cache->size_states()}, {"limit_bytes", prompt_cache->limit_size}};
+                    }
+                    j["disk"] = disk ? disk->to_json() : json();
+                    auto res = std::make_unique<server_task_result_slots>();
+                    res->id         = task.id;
+                    res->slots_data = std::move(j);
+                    queue_results.send(std::move(res));
+                } break;
+            case SERVER_TASK_TYPE_PROMPT_CACHE_FLUSH:
+                {
+                    if (disk) {
+                        for (auto & slot : slots) {
+                            if (!slot.is_processing()) {
+                                flush_slot(slot, "idle");
+                            }
+                        }
+                        disk->flush_done();
+                    }
+                } break;
             case SERVER_TASK_TYPE_SLOT_SAVE:
                 {
                     const int id_slot = task.slot_action.id_slot;
@@ -3132,31 +3468,12 @@ private:
                     std::string filepath = task.slot_action.filepath;
 
                     std::vector<char> packed;
-                    try {
-                        packed = slot->prompt.tokens.serialize();
-                    } catch (const std::exception & err) {
-                        send_error(task, err.what(), ERROR_TYPE_NOT_SUPPORTED);
+                    size_t nwrite = 0, nwrite_ckpt = 0;
+                    std::string err;
+                    if (!save_slot_to_file(*slot, filepath, packed, nwrite, nwrite_ckpt, err)) {
+                        send_error(task, err, err.rfind("Unable", 0) == 0 ? ERROR_TYPE_SERVER : ERROR_TYPE_NOT_SUPPORTED);
                         break;
                     }
-
-                    GGML_ASSERT(packed.size() % sizeof(llama_token) == 0);
-                    const size_t nwrite = llama_state_seq_save_file(
-                        ctx_tgt, filepath.c_str(), slot->id,
-                        reinterpret_cast<const llama_token *>(packed.data()), packed.size() / sizeof(llama_token));
-                    if (nwrite == 0) {
-                        send_error(task, "Unable to save slot", ERROR_TYPE_SERVER);
-                        break;
-                    }
-
-                    size_t nwrite_ckpt = 0;
-                    if (!save_slot_checkpoints(filepath, *slot, nwrite_ckpt)) {
-                        send_error(task, "Unable to save slot: incomplete context checkpoints", ERROR_TYPE_SERVER);
-                        break;
-                    }
-
-                    // the draft context goes to its own sidecar file, a failure there only costs the draft its warm start
-                    save_slot_draft(filepath, *slot,
-                            slot_tokens_hash(packed.data(), packed.size()), packed.size() / sizeof(llama_token));
 
                     const int64_t t_end = ggml_time_us();
                     const double t_save_ms = (t_end - t_start) / 1000.0;
@@ -3191,48 +3508,12 @@ private:
                     std::string filename = task.slot_action.filename;
                     std::string filepath = task.slot_action.filepath;
 
-                    size_t nread = 0;
-                    uint64_t draft_tokens_hash = 0;
-                    uint64_t draft_n_packed    = 0;
-                    try {
-                        size_t n_packed = 0;
-                        llama_tokens packed;
-                        nread = llama_state_seq_load_file(ctx_tgt, filepath.c_str(), slot->id, nullptr, 0, &n_packed);
-                        if (nread != 0) {
-                            packed.resize(std::max<size_t>(1, n_packed));
-                            nread = llama_state_seq_load_file(ctx_tgt, filepath.c_str(), slot->id, packed.data(), packed.size(), &n_packed);
-                        }
-                        if (nread == 0) {
-                            throw std::runtime_error("No available space in KV cache or invalid slot save file");
-                        }
-                        packed.resize(n_packed);
-
-                        draft_tokens_hash = slot_tokens_hash(packed.data(), packed.size() * sizeof(llama_token));
-                        draft_n_packed    = packed.size();
-
-                        server_tokens restored = server_tokens::deserialize(packed, mctx != nullptr);
-
-                        if (restored.size() > (size_t) slot->n_ctx) {
-                            throw std::runtime_error("Restored prompt does not fit in the slot context");
-                        }
-
-                        if (!restored.validate(ctx_tgt)) {
-                            throw std::runtime_error("Invalid tokens in slot save file");
-                        }
-
-                        slot->prompt.clear();
-                        slot->prompt.tokens = std::move(restored);
-                    } catch (const std::exception & err) {
-                        slot->prompt_clear();
-                        send_error(task, std::string("Unable to restore slot: ") + err.what(), ERROR_TYPE_INVALID_REQUEST);
+                    size_t n_bytes = 0;
+                    std::string err;
+                    if (!restore_slot_from_file(*slot, filepath, n_bytes, err)) {
+                        send_error(task, std::string("Unable to restore slot: ") + err, ERROR_TYPE_INVALID_REQUEST);
                         break;
                     }
-
-                    // nread is the end offset of the llama state payload within the file
-                    const size_t nread_ckpt = load_slot_checkpoints(filepath, nread, *slot);
-
-                    // after the checkpoints: their draft test-load clears the draft sequence
-                    load_slot_draft(filepath, *slot, draft_tokens_hash, draft_n_packed);
 
                     const int64_t t_end = ggml_time_us();
                     const double t_restore_ms = (t_end - t_start) / 1000.0;
@@ -3243,7 +3524,7 @@ private:
                     res->filename = filename;
                     res->is_save  = false;
                     res->n_tokens = slot->prompt.tokens.size();
-                    res->n_bytes  = nread + nread_ckpt;
+                    res->n_bytes  = n_bytes;
                     res->t_ms     = t_restore_ms;
                     queue_results.send(std::move(res));
                 } break;
@@ -4914,6 +5195,8 @@ bool server_context::load_model(common_params & params) {
 void server_context::start_loop() {
     auto & params = impl->params_base;
     impl->queue_tasks.start_loop(params.sleep_idle_seconds * 1000);
+    // the loop ended (terminate): the contexts are still alive, on this thread - the disk tier's last chance
+    impl->flush_on_exit("shutdown");
 }
 
 void server_context::terminate() {
@@ -5533,6 +5816,28 @@ void server_routes::init_routes() {
             }
         }
 
+        res->ok(res_task->to_json());
+        return res;
+    };
+
+    this->get_prompt_cache = [this](const server_http_req & req) {
+        auto res = create_response();
+        {
+            server_task task(SERVER_TASK_TYPE_PROMPT_CACHE_GET);
+            task.id = res->rd.get_new_id();
+            res->rd.post_task(std::move(task), true); // high-priority task
+        }
+        auto result = res->rd.next(req.should_stop);
+        if (!result) {
+            GGML_ASSERT(req.should_stop());
+            return res;
+        }
+        if (result->is_error()) {
+            res->error(result->to_json());
+            return res;
+        }
+        auto * res_task = dynamic_cast<server_task_result_slots*>(result.get());
+        GGML_ASSERT(res_task != nullptr);
         res->ok(res_task->to_json());
         return res;
     };

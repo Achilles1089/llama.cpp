@@ -1740,6 +1740,48 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_IDLE_SLOTS").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--cache-dir"}, "PATH",
+        "directory for the disk tier of the prompt cache: states too big for --cache-ram, or evicted from it, are kept "
+        "there as slot files and restored when their prompt comes back (default: disabled; needs --cache-ram)",
+        [](common_params & params, const std::string & value) {
+            params.cache_dir = value;
+            if (!fs_is_directory(params.cache_dir)) {
+                throw std::invalid_argument("not a directory: " + value);
+            }
+            if (!params.cache_dir.empty() && params.cache_dir[params.cache_dir.size() - 1] != DIRECTORY_SEPARATOR) {
+                params.cache_dir += DIRECTORY_SEPARATOR;
+            }
+        }
+    ).set_env("LLAMA_ARG_CACHE_DIR").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--cache-dir-max"}, "N",
+        string_format("byte budget of the disk tier in MiB, oldest-used evicted first (default: %d, 0 = none)", params.cache_dir_max_mib),
+        [](common_params & params, int value) {
+            params.cache_dir_max_mib = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_DIR_MAX").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--cache-dir-free-min"}, "N",
+        string_format("never fill the disk tier's volume past this much free space, in MiB (default: %d, 0 = no floor)", params.cache_dir_free_min_mib),
+        [](common_params & params, int value) {
+            params.cache_dir_free_min_mib = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_DIR_FREE_MIN").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--cache-dir-min-tokens"}, "N",
+        string_format("prompts shorter than this never go to the disk tier (default: %d)", params.cache_dir_min_tokens),
+        [](common_params & params, int value) {
+            params.cache_dir_min_tokens = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_DIR_MIN_TOKENS").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--cache-dir-idle-flush"}, "N",
+        string_format("write idle slots to the disk tier after N seconds without a request (default: %d, 0 = never)", params.cache_dir_idle_flush_s),
+        [](common_params & params, int value) {
+            params.cache_dir_idle_flush_s = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_DIR_IDLE_FLUSH").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--context-shift"},
         {"--no-context-shift"},
         string_format("whether to use context shift on infinite text generation (default: %s)", params.ctx_shift ? "enabled" : "disabled"),

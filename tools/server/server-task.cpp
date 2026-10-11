@@ -1691,7 +1691,7 @@ json server_task_result_apply_lora::to_json() {
 //
 // server_prompt_cache
 //
-size_t server_prompt_cache::size() const {
+size_t server_prompt_cache::size_states() const {
     size_t res = 0;
 
     for (const auto & state : states) {
@@ -1699,6 +1699,25 @@ size_t server_prompt_cache::size() const {
     }
 
     return res;
+}
+
+size_t server_prompt_cache::size() const {
+    return size_states() + (in_flight ? in_flight() : 0);
+}
+
+void server_prompt_cache::evict_front(const char * why) {
+    if (states.empty()) {
+        return;
+    }
+    SRV_WRN(" - prompt cache: the oldest entry leaves RAM (%d tokens, %.3f MiB) [%s]%s\n",
+            states.front().prompt.n_tokens(), states.front().size() / (1024.0 * 1024.0), why, on_evict ? " - to the disk tier" : "");
+    if (on_evict) {
+        auto st = std::move(states.front());
+        states.pop_front();
+        on_evict(std::move(st), why);
+    } else {
+        states.pop_front();
+    }
 }
 
 size_t server_prompt_cache::n_tokens() const {
@@ -1711,13 +1730,17 @@ size_t server_prompt_cache::n_tokens() const {
     return res;
 }
 
-server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & prompt, size_t state_size_tgt, size_t state_size_dft) {
+server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & prompt, size_t state_size_tgt, size_t state_size_dft, alloc_status * status) {
+    auto set = [&](alloc_status s) { if (status) { *status = s; } };
+    set(ALLOC_OK);
+
     // first check if the current state is contained fully in the cache
     for (auto it = states.begin(); it != states.end(); ++it) {
         const int cur_lcp_len = it->prompt.tokens.get_common_prefix(prompt.tokens);
 
         if (cur_lcp_len == (int) prompt.tokens.size()) {
             SRV_TRC("%s", " - prompt is already in the cache, skipping\n");
+            set(ALLOC_CACHED);
             return nullptr;
         }
     }
@@ -1730,10 +1753,11 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
 
     const size_t state_size_new = state_size_tgt + state_size_dft + checkpoints_size;
 
-    // skip over-limit entries to avoid disturbing the cache
+    // skip over-limit entries to avoid disturbing the cache - the disk tier takes them from the slot instead
     if (limit_size > 0 && state_size_new > limit_size) {
-        SRV_WRN(" - prompt state size %.3f MiB exceeds cache size limit %.3f MiB, skipping\n",
-                state_size_new / (1024.0 * 1024.0), limit_size / (1024.0 * 1024.0));
+        SRV_WRN(" - prompt state size %.3f MiB exceeds cache size limit %.3f MiB, %s\n",
+                state_size_new / (1024.0 * 1024.0), limit_size / (1024.0 * 1024.0), on_evict ? "to the disk tier" : "skipping");
+        set(ALLOC_OVER_LIMIT);
         return nullptr;
     }
 
@@ -1753,10 +1777,12 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     if (limit_size > 0) {
         // make room before allocating the new vectors to avoid breaching the limit
         while (!states.empty() && size() + state_size_new > limit_size) {
-            SRV_WRN(" - making room for prompt cache entry, removing oldest entry (size = %.3f MiB)\n",
-                    states.front().size() / (1024.0 * 1024.0));
-
-            states.pop_front();
+            evict_front("ram-full");
+        }
+        if (states.empty() && size() + state_size_new > limit_size) {
+            // only bytes in flight to the disk tier are left: no room for a RAM copy right now
+            set(ALLOC_NO_HEADROOM);
+            return nullptr;
         }
     }
 
@@ -1776,6 +1802,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
 
         update();
 
+        set(ALLOC_NO_MEMORY);
         return nullptr;
     }
 
@@ -1885,24 +1912,19 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 void server_prompt_cache::update() {
     if (limit_size > 0) {
         while (!states.empty() && size() > limit_size) {
-            SRV_WRN(" - cache size limit reached, removing oldest entry (size = %.3f MiB)\n", states.front().size() / (1024.0 * 1024.0));
-
-            states.pop_front();
+            evict_front("ram-limit");
         }
     }
 
     // average size per token
-    const float size_per_token = std::max<float>(1.0f, float(size()) / (std::max<size_t>(1, n_tokens())));
+    const float size_per_token = std::max<float>(1.0f, float(size_states()) / (std::max<size_t>(1, n_tokens())));
 
     // dynamically increase the token limit if it can fit in the memory limit
     const size_t limit_tokens_cur = limit_size > 0 ? std::max<size_t>(limit_tokens, limit_size/size_per_token) : limit_tokens;
 
     if (limit_tokens > 0) {
         while (!states.empty() && n_tokens() > limit_tokens_cur) {
-            SRV_WRN(" - cache token limit (%zu, est: %zu) reached, removing oldest entry (size = %.3f MiB)\n",
-                    limit_tokens, limit_tokens_cur, states.front().size() / (1024.0 * 1024.0));
-
-            states.pop_front();
+            evict_front("token-limit");
         }
     }
 
