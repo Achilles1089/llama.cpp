@@ -22,7 +22,7 @@
 //
 
 static bool task_resets_idle_timer(server_task_type type) {
-    return type != SERVER_TASK_TYPE_METRICS;
+    return type != SERVER_TASK_TYPE_METRICS && type != SERVER_TASK_TYPE_PROMPT_CACHE_GET && type != SERVER_TASK_TYPE_PROMPT_CACHE_FLUSH;
 }
 
 int server_queue::post(server_task && task, bool front) {

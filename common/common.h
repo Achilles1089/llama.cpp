@@ -629,6 +629,11 @@ struct common_params {
     int32_t n_ctx_checkpoints   = 32;    // max number of context checkpoints per slot
     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
+    std::string cache_dir;                       // the disk tier under the RAM prompt cache (server): "" = off
+    int32_t cache_dir_max_mib      = 200 * 1024; // its byte budget, oldest-used evicted first (0 = none)
+    int32_t cache_dir_free_min_mib = 100 * 1024; // never fill the volume past this much free (0 = no floor)
+    int32_t cache_dir_min_tokens   = 0;          // prompts shorter than this never go to disk
+    int32_t cache_dir_idle_flush_s = 1800;       // idle slots are written to disk after this long quiet (0 = never)
 
     std::string hostname      = "127.0.0.1";
     std::string public_path   = "";                                                                         // NOLINT
