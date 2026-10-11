@@ -273,6 +273,7 @@ int llama_server(common_params & params, int argc, char ** argv) {
     ctx_http.get ("/slots",                    ex_wrapper(routes.get_slots));
     ctx_http.post("/slots/:id_slot",           ex_wrapper(routes.post_slots));
     ctx_http.get ("/prompt-cache",             ex_wrapper(routes.get_prompt_cache)); // the RAM tier and the disk tier
+    ctx_http.post("/prompt-cache/flush",       ex_wrapper(routes.post_prompt_cache_flush)); // {"id_slot": N} → that slot's state into the disk tier now
 
     // resumable streaming: a child binds the local session factories, the router binds
     // proxies that resolve the owning child, see server-stream.h

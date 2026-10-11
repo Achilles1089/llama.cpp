@@ -1385,6 +1385,7 @@ private:
                     disk->on_idle_flush = [this]() {
                         server_task task(SERVER_TASK_TYPE_PROMPT_CACHE_FLUSH);
                         task.id = queue_tasks.get_new_id();
+                        task.slot_action.id_slot = -1;   // every idle slot
                         queue_tasks.post(std::move(task));
                     };
                 }
@@ -3169,6 +3170,34 @@ private:
                 } break;
             case SERVER_TASK_TYPE_PROMPT_CACHE_FLUSH:
                 {
+                    if (task.slot_action.id_slot >= 0) {
+                        // POST /prompt-cache/flush {"id_slot": N}: this slot's state into the tier now - the import path
+                        // (restore a slot file with /slots, then flush) and a client's explicit "keep this"
+                        server_slot * slot = get_slot_by_id(task.slot_action.id_slot);
+                        auto res = std::make_unique<server_task_result_slots>();
+                        res->id = task.id;
+                        if (slot == nullptr) {
+                            send_error(task, "Invalid slot ID", ERROR_TYPE_INVALID_REQUEST);
+                            break;
+                        }
+                        if (slot->is_processing()) {
+                            queue_tasks.defer(std::move(task));
+                            break;
+                        }
+                        if (!disk) {
+                            send_error(task, "no disk tier - start with --cache-dir", ERROR_TYPE_NOT_SUPPORTED);
+                            break;
+                        }
+                        const bool done = flush_slot(*slot, "import", true);
+                        std::string id;
+                        try {
+                            id = server_prompt_cache_disk::id_of(slot->prompt.tokens.serialize());
+                        } catch (...) {
+                        }
+                        res->slots_data = {{"id_slot", slot->id}, {"flushed", done}, {"id", id}, {"n_tokens", slot->prompt.n_tokens()}};
+                        queue_results.send(std::move(res));
+                        break;
+                    }
                     if (disk) {
                         for (auto & slot : slots) {
                             if (!slot.is_processing()) {
@@ -5398,6 +5427,42 @@ void server_routes::init_routes() {
             server_task task(SERVER_TASK_TYPE_PROMPT_CACHE_GET);
             task.id = res->rd.get_new_id();
             res->rd.post_task(std::move(task), true); // high-priority task
+        }
+        auto result = res->rd.next(req.should_stop);
+        if (!result) {
+            GGML_ASSERT(req.should_stop());
+            return res;
+        }
+        if (result->is_error()) {
+            res->error(result->to_json());
+            return res;
+        }
+        auto * res_task = dynamic_cast<server_task_result_slots*>(result.get());
+        GGML_ASSERT(res_task != nullptr);
+        res->ok(res_task->to_json());
+        return res;
+    };
+
+    this->post_prompt_cache_flush = [this](const server_http_req & req) {
+        auto res = create_response();
+        int id_slot = -1;
+        try {
+            const json body = req.body.empty() ? json::object() : json::parse(req.body);
+            id_slot = body.value("id_slot", -1);
+        } catch (const std::exception & e) {
+            res->error(format_error_response(std::string("invalid body: ") + e.what(), ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        if (id_slot < 0) {
+            res->error(format_error_response("id_slot is required", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        {
+            server_task task(SERVER_TASK_TYPE_PROMPT_CACHE_FLUSH);
+            task.id = res->rd.get_new_id();
+            task.id_slot = id_slot;                 // pinned, so it queues behind that slot's own work
+            task.slot_action.id_slot = id_slot;
+            res->rd.post_task(std::move(task));
         }
         auto result = res->rd.next(req.should_stop);
         if (!result) {
