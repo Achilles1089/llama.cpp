@@ -1774,7 +1774,8 @@ private:
 
         // find the slot that has at least n% prompt similarity
         if (slot_prompt_similarity != 0.0f) {
-            float f_sim_best = 0;
+            float  f_sim_best = 0;
+            size_t lcp_best   = 0;
 
             for (server_slot & slot : slots) {
                 // a pinned task only considers its own slot
@@ -1810,21 +1811,28 @@ private:
                 // select the current slot if the criteria match
                 if (f_sim_cur > f_sim_best && f_sim_cur > slot_prompt_similarity) {
                     f_sim_best = f_sim_cur;
+                    lcp_best   = lcp_len;
 
                     ret = &slot;
                 }
             }
 
             if (ret != nullptr) {
+                const size_t n_slot = ret->prompt.tokens.size();
+
                 // empty slot: nothing to keep, avoid 0/0
-                const float f_keep = ret->prompt.tokens.size() > 0 ?
-                    (f_sim_best*task.tokens.size()) / ret->prompt.tokens.size() : 0.0f;
+                const float f_keep = n_slot > 0 ? float(lcp_best) / n_slot : 0.0f;
 
                 SLT_INF(*ret, "selected slot by %s, f_sim_best = %.3f (> %.3f thold), f_keep = %.3f\n",
                         task.id_slot == -1 ? "LCP similarity" : "id (pinned)", f_sim_best, slot_prompt_similarity, f_keep);
 
-                // if we are about to lose a large portion of the existing context - save it in the prompt cache
-                if (f_keep < 0.5f) {
+                // if we are about to lose a large portion of the existing context - save it in the prompt cache.
+                // a DIVERGENCE saves too (Raven, 2026-10-11): a new chat that shares only the system head with the chat
+                // in the slot (f_keep 0.64 there) would otherwise drop that chat's whole tail unsaved — a day of chat
+                // gone from RAM, re-read on its next open. The slot's prompt goes unsaved only when the new prompt
+                // CONTINUES it: the divergence sits inside the end-of-turn rendering jitter of the last reply
+                constexpr size_t DIVERGE_KEEP_TOKENS = 256;
+                if (f_keep < 0.5f || (n_slot > 0 && lcp_best + DIVERGE_KEEP_TOKENS < n_slot)) {
                     update_cache = true;
                 }
             }

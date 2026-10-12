@@ -622,6 +622,11 @@ bool server_prompt_cache_disk::find_better(const server_prompt & prompt, const s
         if (f_keep < 0.25f) {
             continue;   // don't trash large prompts
         }
+        // a restore reads GBs from the SSD: it must gain more than a sliver over what the slot already holds
+        // (2026-10-11: slot 27305 vs entry 27306 — 3 GB read to save one token)
+        if (resume <= lcp_slot + std::max(64, (int) tokens_new.size() / 100)) {
+            continue;
+        }
         if (f_keep_best < f_keep && f_sim_best < f_sim) {
             f_keep_best = f_keep;
             f_sim_best  = f_sim;
