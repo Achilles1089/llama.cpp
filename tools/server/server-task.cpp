@@ -1841,6 +1841,12 @@ std::list<server_prompt_cache_state>::iterator server_prompt_cache::find_better(
             continue;
         }
 
+        // a load costs seconds (a memcpy of GBs): it must gain more than a sliver over what the slot already holds
+        // (Raven, 2026-10-11: slot 27305 vs entry 27306 — a restore to save one token)
+        if (lcp_cur <= lcp_best + std::max(64, (int) tokens_new.size() / 100)) {
+            continue;
+        }
+
         if (f_keep_best < f_keep_cur && f_sim_best < f_sim_cur) {
             f_keep_best = f_keep_cur;
             f_sim_best  = f_sim_cur;
