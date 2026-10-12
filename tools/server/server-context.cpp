@@ -1712,8 +1712,21 @@ private:
             const bool disk_better = can_cache && disk && disk->find_better(ret->prompt, task.tokens, ret->n_ctx, disk_hit);
 
             // the RAM tier's best entry, scored the same way: where it would resume
-            const bool ram_better = can_cache && prompt_cache->has_better(ret->prompt, task.tokens);
-            const int  ram_resume = ram_better ? prompt_cache->best_resume(ret->prompt, task.tokens) : 0;
+            bool ram_better = can_cache && prompt_cache->has_better(ret->prompt, task.tokens);
+            int  ram_resume = ram_better ? prompt_cache->best_resume(ret->prompt, task.tokens) : 0;
+
+            // a state in the writer's hands (evicted from RAM, its file not yet on the index) is still in memory: it
+            // competes as a RAM state and loads by memcpy (14:0x: a chat's fresh state was being written for 10 s and
+            // its open took an older copy from the SSD)
+            server_prompt_disk_hit fly_hit;
+            const bool fly_better = can_cache && disk && disk->find_better_inflight(ret->prompt, task.tokens, ret->n_ctx, fly_hit);
+            const bool use_fly    = fly_better && (!ram_better || fly_hit.score.resume > ram_resume);
+            if (use_fly) {
+                SLT_INF(*ret, "prompt-cache: a state in the writer's hands resumes at %d (RAM %d) — it loads from memory\n",
+                        fly_hit.score.resume, ram_resume);
+                ram_better = true;
+                ram_resume = fly_hit.score.resume;
+            }
 
             // THE TIERS COMPETE ON WHERE THEY RESUME (2026-10-12 08:21, live: a chat's own whole state on the SSD lost to
             // another chat's RAM state that matched only the shared head — 16k of 28k resumed, 62 s — because the RAM
@@ -1743,7 +1756,7 @@ private:
 
                 const int64_t t_start = ggml_time_us();
 
-                if (ram_better && !disk_wins) {
+                if (ram_better && !disk_wins && !use_fly) {
                     // the entry about to load becomes the newest: the save below evicts the OLDEST first when RAM is
                     // full, and it evicted the chosen entry itself (10:53: a new chat's first turn, the head's state
                     // picked at 16,093, then five evictions for the outgoing 61k chat, then a cold read of everything)
@@ -1761,7 +1774,8 @@ private:
                 bool from_ram   = false;
                 bool from_disk  = disk_wins;
                 if (ram_better && !disk_wins) {
-                    from_ram = ret->prompt_load(*prompt_cache, task.tokens);
+                    from_ram = use_fly ? disk->load_inflight(fly_hit.id, ret->prompt, ret->ctx_tgt, ret->ctx_dft, ret->id)
+                                       : ret->prompt_load(*prompt_cache, task.tokens);
                     if (!from_ram) {
                         // the chosen RAM state is gone (the save above still evicted it, or the load failed): the
                         // disk tier is asked again — evicted states are on their way there — and the slot starts

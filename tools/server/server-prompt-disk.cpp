@@ -476,14 +476,119 @@ void server_prompt_cache_disk::writer_loop() {
             }
             j = std::move(queue.front());
             queue.pop_front();
+            writing = &j;             // a request may still load this state from memory while it is written
         }
         try {
             write_one(j);
         } catch (const std::exception & e) {
             SRV_ERR("prompt-cache disk: write of %s failed: %s\n", j.id.c_str(), e.what());
         }
+        {
+            std::lock_guard<std::mutex> lock(m);   // a load in progress holds `m`: it finishes before `j` dies
+            writing = nullptr;
+        }
         in_flight -= j.bytes;
     }
+}
+
+static bool score_state(const server_prompt & prompt, const server_tokens & tokens_new, int n_ctx_slot,
+                        const server_prompt_cache_state & st, int lcp_slot, float & f_keep_best, float & f_sim_best,
+                        server_prompt_disk_score & score) {
+    const auto & toks = st.prompt.tokens;
+    if (toks.size() == 0 || (int) toks.size() > n_ctx_slot) {
+        return false;
+    }
+    const int lcp = (int) toks.get_common_prefix(tokens_new);
+    int resume = 0;
+    if (lcp == (int) toks.size()) {
+        resume = lcp;
+    } else {
+        for (const auto & c : st.prompt.checkpoints) {
+            if ((int) c.n_tokens <= lcp && (int) c.n_tokens > resume) {
+                resume = (int) c.n_tokens;
+            }
+        }
+    }
+    const float f_keep = float(lcp) / toks.size();
+    const float f_sim  = float(resume) / tokens_new.size();
+    if (f_keep < 0.25f) {
+        return false;
+    }
+    if (resume <= lcp_slot + std::max(64, (int) tokens_new.size() / 100)) {
+        return false;
+    }
+    if (f_keep_best < f_keep && f_sim_best < f_sim) {
+        f_keep_best = f_keep;
+        f_sim_best  = f_sim;
+        score       = {lcp, resume, f_keep, f_sim};
+        return true;
+    }
+    (void) prompt;
+    return false;
+}
+
+bool server_prompt_cache_disk::find_better_inflight(const server_prompt & prompt, const server_tokens & tokens_new, int n_ctx_slot, server_prompt_disk_hit & hit) const {
+    if (tokens_new.size() == 0) {
+        return false;
+    }
+    const int lcp_slot = (int) prompt.tokens.get_common_prefix(tokens_new);
+    float f_keep_best = prompt.tokens.size() > 0 ? float(lcp_slot) / prompt.tokens.size() : -1.0f;
+    float f_sim_best  = float(lcp_slot) / tokens_new.size();
+
+    std::lock_guard<std::mutex> lock(m);
+    const job * best = nullptr;
+    server_prompt_disk_score best_score;
+    for (const auto & j : queue) {
+        if (score_state(prompt, tokens_new, n_ctx_slot, j.st, lcp_slot, f_keep_best, f_sim_best, best_score)) {
+            best = &j;
+        }
+    }
+    if (writing != nullptr && score_state(prompt, tokens_new, n_ctx_slot, writing->st, lcp_slot, f_keep_best, f_sim_best, best_score)) {
+        best = writing;
+    }
+    if (best == nullptr) {
+        return false;
+    }
+    hit.id       = best->id;
+    hit.path     = "";
+    hit.n_tokens = (int) best->st.prompt.tokens.size();
+    hit.score    = best_score;
+    return true;
+}
+
+bool server_prompt_cache_disk::load_inflight(const std::string & id, server_prompt & prompt, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) const {
+    std::lock_guard<std::mutex> lock(m);   // held across the copy: the writer never frees the job under us
+    const job * j = nullptr;
+    for (const auto & q : queue) {
+        if (q.id == id) {
+            j = &q;
+            break;
+        }
+    }
+    if (j == nullptr && writing != nullptr && writing->id == id) {
+        j = writing;
+    }
+    if (j == nullptr) {
+        return false;                      // written and gone from the writer: the disk tier has it now
+    }
+    {
+        const auto & data = j->st.data.main;
+        const size_t n = llama_state_seq_set_data_ext(ctx_tgt, data.data(), data.size(), id_slot, 0);
+        if (n != data.size()) {
+            SRV_ERR("prompt-cache disk: an in-flight state could not be loaded (%zu of %zu bytes)\n", n, data.size());
+            return false;
+        }
+    }
+    if (!j->st.data.drft.empty() && ctx_dft != nullptr) {
+        const auto & data = j->st.data.drft;
+        const size_t n = llama_state_seq_set_data_ext(ctx_dft, data.data(), data.size(), id_slot, 0);
+        if (n != data.size()) {
+            SRV_WRN("prompt-cache disk: an in-flight draft state could not be loaded (%zu of %zu bytes)\n", n, data.size());
+            return false;
+        }
+    }
+    prompt = j->st.prompt.clone();         // the writer keeps its copy for the file
+    return true;
 }
 
 void server_prompt_cache_disk::add_streamed(const std::string & id, llama_tokens && packed, size_t payload_end, size_t bytes, const char * why) {
