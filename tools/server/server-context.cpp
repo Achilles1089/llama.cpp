@@ -2465,10 +2465,15 @@ private:
         const int id_task = slot.task->id;
 
         // evict checkpoints within min-step of a previous checkpoint, unless they were
-        // created by the current task
+        // created by the current task — or they sit at or after the LAST USER MESSAGE of this prompt: those are what
+        // the next turn resumes from (a touch leaves one at its user line, 2026-10-12 11:44: the touch after it, resumed
+        // 4 tokens from the end, culled that line's checkpoint as "too close" to one 2,397 tokens earlier, and the turn
+        // rewound 2,441 tokens instead of 11)
+        const int64_t keep_from = slot.task ? (int64_t) slot.task->params.message_spans.last_user_message_pos() : -1;
         int64_t last = -1;
         for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end(); ) {
-            if (it->id_task != id_task && last >= 0 && it->n_tokens <= last + params_base.checkpoint_min_step) {
+            const bool at_tail = keep_from > 0 && it->n_tokens >= keep_from;
+            if (!at_tail && it->id_task != id_task && last >= 0 && it->n_tokens <= last + params_base.checkpoint_min_step) {
                 SLT_TRC(slot, "erasing context checkpoint too close to an earlier one (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                         it->pos_min, it->pos_max, it->n_tokens, (float) it->size() / 1024 / 1024);
 
