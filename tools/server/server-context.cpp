@@ -2792,8 +2792,10 @@ private:
             types.push_back(common_speculative_type_to_str(t));
         }
         const json drafts = finfo(params_base.speculative.draft.mparams.path);
+        // NOT the build id (2026-10-11: a rebuild of the server dropped every file on disk — 27 GB of his chats, every
+        // one cold). What makes a state loadable is the weights, the KV/context shape and the file formats below; the
+        // llama state loader checks the rest. A server-code rebuild keeps the tier.
         return {
-            {"build", llama_build_info()},
             {"state_seq_version", LLAMA_STATE_SEQ_VERSION},
             {"ckpt_version", server_slot_file::CKPT_VERSION},
             {"draft_version", server_slot_file::DRAFT_VERSION},
