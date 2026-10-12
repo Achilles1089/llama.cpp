@@ -1869,6 +1869,24 @@ bool server_prompt_cache::has_better(const server_prompt & prompt, const server_
     return find_better(prompt, tokens_new) != states.end();
 }
 
+int server_prompt_cache::best_resume(const server_prompt & prompt, const server_tokens & tokens_new) {
+    const auto it = find_better(prompt, tokens_new);
+    if (it == states.end()) {
+        return 0;
+    }
+    const int lcp = it->prompt.tokens.get_common_prefix(tokens_new);
+    if ((size_t) lcp == it->prompt.tokens.size()) {
+        return lcp;                          // the entry is a prefix of the request: its end state resumes as is
+    }
+    int resume = 0;
+    for (const auto & c : it->prompt.checkpoints) {
+        if ((int) c.n_tokens <= lcp && (int) c.n_tokens > resume) {
+            resume = (int) c.n_tokens;
+        }
+    }
+    return resume;
+}
+
 bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
     auto it_best = find_better(prompt, tokens_new);
 

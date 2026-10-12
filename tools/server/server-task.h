@@ -700,6 +700,11 @@ struct server_prompt_cache {
     // same check as find_better, without touching any state
     bool has_better(const server_prompt & prompt, const server_tokens & tokens_new);
 
+    // where the better entry would RESUME for tokens_new: the whole entry when fully covered, else its newest checkpoint
+    // at or below the divergence (a hybrid rewinds to a checkpoint) — 0 when there is no better entry. The disk tier
+    // scores itself the same way (server-prompt-disk.cpp), so the two tiers can compete on this number.
+    int best_resume(const server_prompt & prompt, const server_tokens & tokens_new);
+
     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
 
     void update();
