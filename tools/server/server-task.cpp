@@ -1866,6 +1866,13 @@ bool server_prompt_cache::has_better(const server_prompt & prompt, const server_
     return find_better(prompt, tokens_new) != states.end();
 }
 
+void server_prompt_cache::hold_better(const server_prompt & prompt, const server_tokens & tokens_new) {
+    const auto it = find_better(prompt, tokens_new);
+    if (it != states.end()) {
+        states.splice(states.end(), states, it);
+    }
+}
+
 int server_prompt_cache::best_resume(const server_prompt & prompt, const server_tokens & tokens_new) {
     const auto it = find_better(prompt, tokens_new);
     if (it == states.end()) {
