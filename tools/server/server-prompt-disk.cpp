@@ -259,14 +259,48 @@ bool server_prompt_cache_disk::is_protected_locked(const server_prompt_disk_entr
     return lcp + slack >= e.tokens.size();
 }
 
+// SUPERSEDE (2026-10-12 16:10, live: 57 states, 214 GB, ten of them one chat): an older state of the SAME conversation
+// is redundant once a longer one exists. "Same conversation" is all but a bounded tail shared — never exact containment:
+// a saved state carries what the slot generated after its prompt (a reply as generated, or a touch's user line and
+// its one token), and the next state carries that reply as the template renders it, so the older is almost never an
+// exact prefix of the newer and the old rule never fired. The tail is bounded by one reply's rendering difference or a
+// touch's line (SUPERSEDE_TAIL); it is far smaller than any chat's own content past a shared head, so two chats of one
+// project never supersede each other.
+static constexpr size_t SUPERSEDE_TAIL = 256;
+
+static bool supersedes(const server_prompt_disk_entry & newer, const server_prompt_disk_entry & older) {
+    if (newer.id == older.id || newer.tokens.size() <= older.tokens.size() || older.tokens.size() == 0) {
+        return false;
+    }
+    const size_t lcp = older.tokens.get_common_prefix(newer.tokens);
+    return lcp + SUPERSEDE_TAIL >= older.tokens.size();
+}
+
 std::vector<server_prompt_disk_entry> server_prompt_cache_disk::evict_locked(const server_prompt_disk_entry * fresh) {
     std::vector<server_prompt_disk_entry> victims;
-    // supersede: an entry fully contained in the fresh one is the same conversation, shorter
     if (fresh != nullptr) {
+        // a fresh write: the older states of its conversation go
         for (auto it = entries.begin(); it != entries.end();) {
-            if (it->id != fresh->id && it->tokens.size() < fresh->tokens.size() &&
-                it->tokens.get_common_prefix(fresh->tokens) == it->tokens.size()) {
+            if (supersedes(*fresh, *it)) {
                 it->why = "superseded";
+                victims.push_back(std::move(*it));
+                it = entries.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    } else {
+        // the scan at startup: every entry against every longer one — the versions the old rule let pile up
+        for (auto it = entries.begin(); it != entries.end();) {
+            bool gone = false;
+            for (const auto & other : entries) {
+                if (supersedes(other, *it)) {
+                    gone = true;
+                    break;
+                }
+            }
+            if (gone) {
+                it->why = "superseded-at-scan";
                 victims.push_back(std::move(*it));
                 it = entries.erase(it);
             } else {
