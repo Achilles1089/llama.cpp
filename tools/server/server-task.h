@@ -705,6 +705,10 @@ struct server_prompt_cache {
     // scores itself the same way (server-prompt-disk.cpp), so the two tiers can compete on this number.
     int best_resume(const server_prompt & prompt, const server_tokens & tokens_new);
 
+    // the better entry becomes the NEWEST (the back of the list): the save of the outgoing state that precedes a load
+    // evicts from the front, and it must never evict the entry chosen to load (2026-10-12 10:53, live: it did)
+    void hold_better(const server_prompt & prompt, const server_tokens & tokens_new);
+
     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
 
     void update();

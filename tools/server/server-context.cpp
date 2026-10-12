@@ -1907,6 +1907,13 @@ private:
 
                 const int64_t t_start = ggml_time_us();
 
+                if (ram_better && !disk_wins) {
+                    // the entry about to load becomes the newest: the save below evicts the OLDEST first when RAM is
+                    // full, and it evicted the chosen entry itself (10:53: a new chat's first turn, the head's state
+                    // picked at 16,093, then five evictions for the outgoing 61k chat, then a cold read of everything)
+                    prompt_cache->hold_better(ret->prompt, task.tokens);
+                }
+
                 server_prompt_cache::alloc_status st = server_prompt_cache::ALLOC_CACHED;
                 ret->prompt_save(*prompt_cache, &st);
                 if (disk && (st == server_prompt_cache::ALLOC_OVER_LIMIT || st == server_prompt_cache::ALLOC_NO_HEADROOM || st == server_prompt_cache::ALLOC_NO_MEMORY)) {
@@ -1915,12 +1922,24 @@ private:
                 }
 
                 bool reset_spec = true;
+                bool from_ram   = false;
+                bool from_disk  = disk_wins;
                 if (ram_better && !disk_wins) {
-                    if (!ret->prompt_load(*prompt_cache, task.tokens)) {
-                        ret->prompt_clear();
+                    from_ram = ret->prompt_load(*prompt_cache, task.tokens);
+                    if (!from_ram) {
+                        // the chosen RAM state is gone (the save above still evicted it, or the load failed): the
+                        // disk tier is asked again — evicted states are on their way there — and the slot starts
+                        // from the best it finds, never from nothing while a state of this chat exists
+                        from_disk = disk && disk->find_better(ret->prompt, task.tokens, ret->n_ctx, disk_hit);
+                        SLT_WRN(*ret, "prompt-cache: the RAM state chosen to load is gone — %s\n",
+                                from_disk ? "the disk tier loads instead" : "nothing else fits: a cold read");
+                        if (!from_disk) {
+                            ret->prompt_clear();
+                        }
                     }
-                } else if (disk_better) {
-                    // a RAM miss: the best state on disk, through the slot-file loader (streamed, no host copy)
+                }
+                if (from_disk) {
+                    // the best state on disk, through the slot-file loader (streamed, no host copy)
                     SLT_INF(*ret, "prompt-cache disk: restoring id=%s (%d tokens, lcp %d, resume %d, f_keep %.3f, f_sim %.3f)\n",
                             disk_hit.id.c_str(), disk_hit.n_tokens, disk_hit.score.lcp, disk_hit.score.resume,
                             disk_hit.score.f_keep, disk_hit.score.f_sim);
