@@ -4037,7 +4037,7 @@ private:
 
                                 if (pos_min >= pos_min_thold) {
                                     // search for a context checkpoint
-                                    const auto it = std::find_if(
+                                    auto it = std::find_if(
                                         slot.prompt.checkpoints.rbegin(),
                                         slot.prompt.checkpoints.rend(),
                                         [&](const auto & cur) {
@@ -4050,6 +4050,41 @@ private:
                                             return cur.pos_min < pos_min_thold || cur.pos_min == 0;
                                         }
                                     );
+
+                                    // THE LAST USER MESSAGE GETS ITS CHECKPOINT (2026-10-12 13:00, live): a prompt that
+                                    // resumes at a checkpoint PAST the start of its last user message (a touch resuming
+                                    // 4 tokens from the end of an identical earlier prompt) never processes that line
+                                    // again, so no checkpoint is ever made at it — and the next turn, which diverges
+                                    // exactly there, rewinds to the previous checkpoint (4.3k back, on every open).
+                                    // When no checkpoint sits at or after that start, resume at the newest one at or
+                                    // below it instead: a few hundred tokens once, then the line has its checkpoint.
+                                    {
+                                        const int32_t lu = slot.task->params.message_spans.last_user_message_pos();
+                                        if (lu > 0 && it != slot.prompt.checkpoints.rend() && it->n_tokens > lu) {
+                                            bool has = false;
+                                            for (const auto & c : slot.prompt.checkpoints) {
+                                                if (c.n_tokens >= lu && c.n_tokens < it->n_tokens) {
+                                                    has = true;
+                                                    break;
+                                                }
+                                            }
+                                            if (!has) {
+                                                const auto it2 = std::find_if(
+                                                    slot.prompt.checkpoints.rbegin(),
+                                                    slot.prompt.checkpoints.rend(),
+                                                    [&](const auto & cur) {
+                                                        return cur.n_tokens <= lu && cur.pos_max <= pos_next
+                                                            && (cur.pos_min < pos_min_thold || cur.pos_min == 0);
+                                                    }
+                                                );
+                                                if (it2 != slot.prompt.checkpoints.rend()) {
+                                                    SLT_INF(slot, "resuming at %" PRId64 " instead of %" PRId64 " so the last user message (at %d) gets its checkpoint — once\n",
+                                                            it2->n_tokens, it->n_tokens, lu);
+                                                    it = it2;
+                                                }
+                                            }
+                                        }
+                                    }
 
                                     bool do_reset = it == slot.prompt.checkpoints.rend();
 
