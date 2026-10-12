@@ -120,6 +120,12 @@ public:
     // tier's find_better, but the hybrid's resume point (a checkpoint at or below the divergence) is what counts
     bool find_better(const server_prompt & prompt, const server_tokens & tokens_new, int n_ctx_slot, server_prompt_disk_hit & hit) const;
 
+    // A STATE IN THE WRITER'S HANDS IS STILL A STATE (2026-10-12 14:0x, live): a chat evicted from RAM is being written
+    // for seconds; a request for it in that window used to take an older copy from disk (581 tokens re-read, 9 s).
+    // The queued and the in-progress jobs are scored like the disk's entries (hit.path empty) and loaded from memory.
+    bool find_better_inflight(const server_prompt & prompt, const server_tokens & tokens_new, int n_ctx_slot, server_prompt_disk_hit & hit) const;
+    bool load_inflight(const std::string & id, server_prompt & prompt, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) const;
+
     bool contains(const std::string & id) const;
     void touch(const std::string & id);
     void drop(const std::string & id, const char * why);
@@ -175,6 +181,7 @@ private:
 
     std::condition_variable cv;
     std::deque<job> queue;
+    const job * writing = nullptr;   // the job under write (the writer's local), readable under `m` while it is set
     std::thread writer;
     bool stop = false;
     std::atomic<size_t> in_flight{0};
