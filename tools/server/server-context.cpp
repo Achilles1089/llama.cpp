@@ -1702,16 +1702,31 @@ private:
             server_prompt_disk_hit disk_hit;
             const bool disk_better = can_cache && disk && disk->find_better(ret->prompt, task.tokens, ret->n_ctx, disk_hit);
 
+            // the RAM tier's best entry, scored the same way: where it would resume
+            const bool ram_better = can_cache && prompt_cache->has_better(ret->prompt, task.tokens);
+            const int  ram_resume = ram_better ? prompt_cache->best_resume(ret->prompt, task.tokens) : 0;
+
+            // THE TIERS COMPETE ON WHERE THEY RESUME (2026-10-12 08:21, live: a chat's own whole state on the SSD lost to
+            // another chat's RAM state that matched only the shared head — 16k of 28k resumed, 62 s — because the RAM
+            // tier was asked first and the disk tier only on a miss). The further resume loads; RAM wins a tie or a
+            // sliver (a memcpy beats a file read).
+            const bool disk_wins = disk_better && (!ram_better
+                || disk_hit.score.resume > ram_resume + std::max(64, (int) task.tokens.size() / 100));
+            if (ram_better && disk_better) {
+                SLT_INF(*ret, "prompt-cache: RAM resumes at %d, disk at %d — %s\n", ram_resume, disk_hit.score.resume,
+                        disk_wins ? "the disk tier loads" : "the RAM tier loads");
+            }
+
             // the checks above only tell if the outgoing state is worth saving
-            // the cache can still hold a better start for this task, so ask it - the RAM tier, then the disk tier
-            update_cache = can_cache && (update_cache || prompt_cache->has_better(ret->prompt, task.tokens) || disk_better);
+            // the cache can still hold a better start for this task, so ask it - whichever tier resumes further
+            update_cache = can_cache && (update_cache || ram_better || disk_better);
 
             if (disk) {
                 disk->note_activity();
                 if (ret->id == reserve_slot) {
                     disk->set_protected(task.tokens.clone());   // the chat in the reserved slot: its states are never evicted
                 }
-                disk->set_held(disk_better ? disk_hit.id : "");  // the entry this request restores: the save below must not evict it
+                disk->set_held(disk_wins ? disk_hit.id : "");  // the entry this request restores: the save below must not evict it
             }
 
             if (update_cache) {
@@ -1727,7 +1742,7 @@ private:
                 }
 
                 bool reset_spec = true;
-                if (prompt_cache->has_better(ret->prompt, task.tokens)) {
+                if (ram_better && !disk_wins) {
                     if (!ret->prompt_load(*prompt_cache, task.tokens)) {
                         ret->prompt_clear();
                     }
