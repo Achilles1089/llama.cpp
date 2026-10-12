@@ -94,7 +94,9 @@ struct server_prompt_disk_hit {
 
 class server_prompt_cache_disk {
 public:
-    // `env` is the provenance every manifest must match (build, weights, draft, kv types, context shape, format versions)
+    // `env` is the provenance every manifest must match — the weights, the draft, kv types, context shape, format versions;
+    // NEVER the server build (a rebuild must keep the tier). A manifest's extra fields are ignored; a mismatch is another
+    // model's state: left alone, never deleted
     server_prompt_cache_disk(server_prompt_disk_params params, json env, bool has_mtmd);
     ~server_prompt_cache_disk();   // drains and joins the writer
 

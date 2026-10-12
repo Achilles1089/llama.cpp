@@ -508,7 +508,7 @@ void server_prompt_cache_disk::add_streamed(const std::string & id, llama_tokens
 void server_prompt_cache_disk::scan() {
     std::error_code ec;
     fs::create_directories(fs::u8path(params.dir), ec);
-    size_t n_ok = 0, n_dropped = 0, n_tmp = 0;
+    size_t n_ok = 0, n_dropped = 0, n_tmp = 0, n_foreign = 0;
     std::vector<server_prompt_disk_entry> found;
     for (const auto & de : fs::directory_iterator(fs::u8path(params.dir), ec)) {
         const std::string name = de.path().filename().u8string();
@@ -537,9 +537,24 @@ void server_prompt_cache_disk::scan() {
             drop("corrupt manifest");
             continue;
         }
-        if (j.value("format", 0) != 1 || j.value("env", json()) != env) {
-            drop("provenance");
+        if (j.value("format", 0) != 1) {
+            drop("format");
             continue;
+        }
+        {
+            // provenance: every field THIS lead requires must match; fields a manifest carries beyond them (an older
+            // lead's "build") are ignored. A mismatch is another model's state (or an older format's): not ours to
+            // load — and not ours to delete (2026-10-11: a rebuild's build id dropped every file; a second model on
+            // the same box would wipe the first's). It stays, uncounted, until its own lead reads or evicts it.
+            const json menv = j.value("env", json::object());
+            bool ours = menv.is_object();
+            for (auto it = env.begin(); ours && it != env.end(); ++it) {
+                ours = menv.contains(it.key()) && menv[it.key()] == it.value();
+            }
+            if (!ours) {
+                n_foreign++;
+                continue;
+            }
         }
         const uint64_t want_main  = j.value("bytes", json::object()).value("main", (uint64_t) 0);
         const uint64_t want_draft = j.value("bytes", json::object()).value("draft", (uint64_t) 0);
@@ -585,9 +600,9 @@ void server_prompt_cache_disk::scan() {
         SRV_INF("prompt-cache disk: evicted id=%s tokens=%zu bytes=%zu why=%s\n", v.id.c_str(), v.tokens.size(), v.bytes, v.why.c_str());
     }
     std::lock_guard<std::mutex> lock(m);
-    SRV_INF("prompt-cache disk: %s — %zu entr%s (%.1f GiB), %zu dropped, %zu tmp removed, budget %.0f GiB, floor %.0f GiB free\n",
+    SRV_INF("prompt-cache disk: %s — %zu entr%s (%.1f GiB), %zu dropped, %zu foreign left alone, %zu tmp removed, budget %.0f GiB, floor %.0f GiB free\n",
             params.dir.c_str(), entries.size(), entries.size() == 1 ? "y" : "ies", total_bytes_locked() / (1024.0 * 1024.0 * 1024.0),
-            n_dropped, n_tmp, params.max_bytes / (1024.0 * 1024.0 * 1024.0), params.free_min_bytes / (1024.0 * 1024.0 * 1024.0));
+            n_dropped, n_foreign, n_tmp, params.max_bytes / (1024.0 * 1024.0 * 1024.0), params.free_min_bytes / (1024.0 * 1024.0 * 1024.0));
 }
 
 bool server_prompt_cache_disk::find_better(const server_prompt & prompt, const server_tokens & tokens_new, int n_ctx_slot, server_prompt_disk_hit & hit) const {
