@@ -3311,15 +3311,17 @@ private:
         return true;
     }
 
-    // shutdown and sleep: the reserved slot's state (streamed, skipped when unchanged) and every RAM state go to disk;
-    // the disk tier's destructor drains its writer
+    // shutdown and sleep: EVERY idle slot's state (streamed, skipped when unchanged) and every RAM state go to disk; the
+    // disk tier's destructor drains its writer. Every slot, not only the reserved one (2026-10-13 09:45: the nightly
+    // journal's thread was collapsed at 23:30 and its fresh state lived in the shared slot alone; the morning's restart
+    // flushed slot 0 and the RAM tier, dropped slot 1, and his first open of the journal re-read 33,709 tokens — 189 s)
     void flush_on_exit(const char * why) {
         if (!disk) {
             return;
         }
         SRV_INF("prompt-cache disk: flush on %s\n", why);
         for (auto & slot : slots) {
-            if (!slot.is_processing() && slot.prompt.n_tokens() > 0 && (reserve_slot < 0 || slot.id == reserve_slot)) {
+            if (!slot.is_processing() && slot.prompt.n_tokens() > 0) {
                 flush_slot(slot, why, true);
             }
         }
