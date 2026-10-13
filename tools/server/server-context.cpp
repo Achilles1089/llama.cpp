@@ -2741,19 +2741,40 @@ private:
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
         const int id_task = slot.task->id;
 
-        // evict checkpoints within min-step of a previous checkpoint, unless they were
-        // created by the current task — or they sit at or after the LAST USER MESSAGE of this prompt: those are what
-        // the next turn resumes from (a touch leaves one at its user line, 2026-10-12 11:44: the touch after it, resumed
-        // 4 tokens from the end, culled that line's checkpoint as "too close" to one 2,397 tokens earlier, and the turn
-        // rewound 2,441 tokens instead of 11)
-        const int64_t keep_from = slot.task ? (int64_t) slot.task->params.message_spans.last_user_message_pos() : -1;
+        // STAGE 2 (2026-10-13, Duncan: "designed to accumulate at a reasonable rate and nothing like we currently
+        // have"). A slot's checkpoints are exactly:
+        //   - one at each USER-MESSAGE START of this prompt, at least checkpoint_min_step apart — the last user
+        //     message's always (the next turn resumes there; law 4, now scoped to that one line, not to everything
+        //     after it),
+        //   - the two NEAR THE END of this prompt (4 + n_ubatch and 4 before it: a continuation resumes there),
+        //   - never two at one position: a checkpoint made where one exists REPLACES it.
+        // Before this: the voice prompt's state carried 32 checkpoints at ONE position (one per prewarm beat — a cache
+        // hit rewinds to the n-4 checkpoint, reads 4 tokens and makes a new n-4 checkpoint beside the old; 181 MiB each,
+        // 5.8 GB of duplicates in an 8k-token state), every open of a chat added one more at its tail the same way, and
+        // the near-end pairs of every past prompt stayed as long as they sat at or after the last user line.
+        const auto &  spans     = slot.task->params.message_spans;
+        const int64_t last_user = spans.last_user_message_pos();
+        const int64_t n_prompt  = slot.task->n_tokens();
+        const int64_t tail_from = n_prompt - (4 + llama_n_ubatch(ctx_tgt) + 1);   // this prompt's near-end region
+        const int64_t new_pos   = slot.prompt.n_tokens() - n_tokens_cur;           // where the new one sits (update_pos)
         int64_t last = -1;
         for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end(); ) {
-            const bool at_tail = keep_from > 0 && it->n_tokens >= keep_from;
-            if (!at_tail && it->id_task != id_task && last >= 0 && it->n_tokens <= last + params_base.checkpoint_min_step) {
-                SLT_TRC(slot, "erasing context checkpoint too close to an earlier one (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
-                        it->pos_min, it->pos_max, it->n_tokens, (float) it->size() / 1024 / 1024);
-
+            const char * why = nullptr;
+            if (it->n_tokens == new_pos) {
+                why = "replaced by the one made now at this position";
+            } else if (it->id_task != id_task) {
+                const bool user_start = spans.is_user_start((int32_t) it->n_tokens);
+                const bool near_end   = it->n_tokens >= tail_from;
+                if (!user_start && !near_end) {
+                    why = "a past prompt's tail: not a user line, no longer near the end";
+                } else if (user_start && it->n_tokens != last_user && last >= 0
+                           && it->n_tokens <= last + params_base.checkpoint_min_step) {
+                    why = "too close to an earlier one";
+                }
+            }
+            if (why != nullptr) {
+                SLT_INF(slot, "erasing context checkpoint (n_tokens = %" PRId64 ", %.1f MiB): %s\n",
+                        it->n_tokens, (float) it->size() / 1024 / 1024, why);
                 it = slot.prompt.checkpoints.erase(it);
                 continue;
             }
@@ -2800,9 +2821,10 @@ private:
         common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
 
         SLT_INF(slot,
-                "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
+                "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB: target %.1f, draft %.1f, spec %.1f)\n",
                 (int) slot.prompt.checkpoints.size(), params_base.n_ctx_checkpoints, cur.pos_min,
-                cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
+                cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024, (float) cur.data_tgt.size() / 1024 / 1024,
+                (float) cur.data_dft.size() / 1024 / 1024, (float) cur.data_spec.size() / 1024 / 1024);
     }
 
     // checkpoints are appended to the slot save file, after the llama state payload
@@ -2913,6 +2935,9 @@ private:
             if (cur.data_tgt.empty()) {
                 SLT_WRN(slot, "invalid context checkpoint appendix in '%s' - ignored\n", filepath.c_str());
                 return 0;
+            }
+            if (!checkpoints.empty() && checkpoints.back().n_tokens == cur.n_tokens) {
+                checkpoints.pop_back();   // a legacy appendix holds duplicates at one position (stage 2): the last one stands
             }
             checkpoints.push_back(std::move(cur));
             if (checkpoints.size() > (size_t) params_base.n_ctx_checkpoints) {
@@ -3243,19 +3268,25 @@ private:
             return false;
         }
         const std::string id = server_prompt_cache_disk::id_of(packed);
-        if (disk->contains(id)) {
-            disk->touch(id);
-            SLT_INF(slot, "prompt-cache disk: unchanged id=%s, not rewritten [%s]\n", id.c_str(), why);
-            return true;
+        const size_t sz_tgt = llama_state_seq_get_size_ext(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        const size_t sz_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
+        size_t sz_ck = 0;
+        for (const auto & c : slot.prompt.checkpoints) {
+            sz_ck += c.size();
+        }
+        const size_t need = sz_tgt + sz_dft + sz_ck;
+        const size_t have = disk->bytes_of(id);
+        if (have > 0) {
+            // the same tokens are on the tier: unchanged — unless the stored copy is clearly BIGGER (a legacy appendix of
+            // duplicate checkpoints, stage 2): then it is rewritten in its new shape
+            if (have <= need + server_prompt_cache_disk::REWRITE_SLACK) {
+                disk->touch(id);
+                SLT_INF(slot, "prompt-cache disk: unchanged id=%s, not rewritten [%s]\n", id.c_str(), why);
+                return true;
+            }
+            disk->drop(id, "rewritten smaller (stage 2: a leaner checkpoint appendix)");
         }
         if (!stream_only && prompt_cache) {
-            const size_t sz_tgt = llama_state_seq_get_size_ext(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
-            const size_t sz_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
-            size_t sz_ck = 0;
-            for (const auto & c : slot.prompt.checkpoints) {
-                sz_ck += c.size();
-            }
-            const size_t need = sz_tgt + sz_dft + sz_ck;
             if (prompt_cache->limit_size == 0 || prompt_cache->size() + need <= prompt_cache->limit_size) {
                 server_prompt_cache_state st;
                 bool ok = sz_tgt > 0;
