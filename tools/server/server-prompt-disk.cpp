@@ -282,7 +282,23 @@ static bool supersedes(const server_prompt_disk_entry & newer, const server_prom
     if (!newer.key.empty() && !older.key.empty()) {
         return false;   // two named conversations are two conversations
     }
-    if (newer.tokens.size() <= older.tokens.size() || older.tokens.size() == 0) {
+    if (!older.key.empty()) {
+        return false;   // a named state is never retired by an unnamed one (22:02 scan: a legacy copy, longer, took the live state)
+    }
+    if (older.tokens.size() == 0) {
+        return false;
+    }
+    if (!newer.key.empty()) {
+        // a named state retires an unnamed copy of ITS chat whatever their lengths: the same chat = they share more
+        // than the head — the unnamed state's first checkpoint sits at its first user message, and two chats of one
+        // surface part within a few tokens after it (the first words, the clock, the folder)
+        const size_t head = older.checkpoints.empty() ? 0 : (size_t) std::max<int64_t>(0, older.checkpoints.front().n_tokens);
+        const size_t lcp  = older.tokens.get_common_prefix(newer.tokens);
+        if (head > 0 && lcp >= head + 64) {
+            return true;
+        }
+    }
+    if (newer.tokens.size() <= older.tokens.size()) {
         return false;
     }
     const size_t lcp = older.tokens.get_common_prefix(newer.tokens);
