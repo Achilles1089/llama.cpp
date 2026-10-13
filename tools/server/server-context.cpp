@@ -1271,6 +1271,24 @@ private:
         if (ctx_dft) {
             ctx_dft_seq_rm_type = common_context_can_seq_rm(ctx_dft);
         }
+        {
+            // STAGE 2, the draft lever (2026-10-13): a checkpoint carried the draft context's whole state — ~4 KiB a token
+            // (211 MiB at 54k, more than the 150 MiB of recurrent state it rides with). After a restore the slot cuts BOTH
+            // memories at the resume position (common_memory::seq_rm), so a draft whose cache can be cut partially
+            // (PART) needs no snapshot in the checkpoint; one that cannot (FULL, or RS beyond its bound) does. Said once.
+            auto name = [](common_context_seq_rm_type t) {
+                switch (t) {
+                    case COMMON_CONTEXT_SEQ_RM_TYPE_NO:   return "no memory";
+                    case COMMON_CONTEXT_SEQ_RM_TYPE_PART: return "cut anywhere (PART)";
+                    case COMMON_CONTEXT_SEQ_RM_TYPE_FULL: return "whole sequences only (FULL)";
+                    case COMMON_CONTEXT_SEQ_RM_TYPE_RS:   return "cut within a bound (RS)";
+                }
+                return "?";
+            };
+            SRV_INF("checkpoints: the target's memory is %s; the draft's is %s — a checkpoint %s the draft's state\n",
+                    name(ctx_tgt_seq_rm_type), ctx_dft ? name(ctx_dft_seq_rm_type) : "absent",
+                    ckpt_carries_draft() ? "carries" : "leaves out");
+        }
 
         if (spec) {
             SRV_TRC("%s", "speculative decoding context initialized\n");
@@ -2486,6 +2504,12 @@ private:
     }
 
     // n_tokens_cur: the number of tokens added to the batch for the current slot
+    // does a context checkpoint need the draft's state? Only when the draft's memory cannot be cut back to the resume
+    // position on its own (the slot cuts both memories there after a restore — common_memory::seq_rm)
+    bool ckpt_carries_draft() const {
+        return ctx_dft != nullptr && ctx_dft_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_PART;
+    }
+
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
         const int id_task = slot.task->id;
 
@@ -2551,7 +2575,10 @@ private:
         cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
 
         cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-        cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        if (ckpt_carries_draft()) {
+            // only a draft that cannot be cut partially needs its state snapshotted (see the init line "checkpoints: …")
+            cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        }
         // stash the draft's speculative state with the checkpoint
         common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
 
