@@ -130,6 +130,8 @@ public:
     bool load_inflight(const std::string & id, server_prompt & prompt, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) const;
 
     bool contains(const std::string & id) const;
+    size_t bytes_of(const std::string & id) const;   // 0 when the id is not on the tier
+    static constexpr size_t REWRITE_SLACK = 64u << 20;   // a stored copy this much bigger than the new state is rewritten (stage 2)
     void touch(const std::string & id);
     void drop(const std::string & id, const char * why);
 

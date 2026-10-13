@@ -455,12 +455,16 @@ bool server_prompt_cache_disk::offer(server_prompt_cache_state && st, std::vecto
         return false;
     }
     const std::string id = id_of(packed);
-    if (contains(id)) {
-        touch(id);
-        SRV_INF("prompt-cache disk: unchanged id=%s tokens=%zu, not rewritten [%s]\n", id.c_str(), n_tokens, why);
-        return false;
-    }
     const size_t bytes = st.size();
+    const size_t have = bytes_of(id);
+    if (have > 0) {
+        if (have <= bytes + REWRITE_SLACK) {
+            touch(id);
+            SRV_INF("prompt-cache disk: unchanged id=%s tokens=%zu, not rewritten [%s]\n", id.c_str(), n_tokens, why);
+            return false;
+        }
+        drop(id, "rewritten smaller (stage 2: a leaner checkpoint appendix)");   // the same tokens, a leaner state
+    }
     {
         std::lock_guard<std::mutex> lock(m);
         if (stop) {
@@ -866,6 +870,16 @@ bool server_prompt_cache_disk::find_better(const server_prompt & prompt, const s
     hit.n_tokens = (int) best->tokens.size();
     hit.score    = best_score;
     return true;
+}
+
+size_t server_prompt_cache_disk::bytes_of(const std::string & id) const {
+    std::lock_guard<std::mutex> lock(m);
+    for (const auto & e : entries) {
+        if (e.id == id) {
+            return e.bytes;
+        }
+    }
+    return 0;
 }
 
 bool server_prompt_cache_disk::contains(const std::string & id) const {
