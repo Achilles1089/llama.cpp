@@ -3031,7 +3031,7 @@ private:
         }
         llama_tokens ids(packed.size() / sizeof(llama_token));
         memcpy(ids.data(), packed.data(), packed.size());
-        disk->add_streamed(id, std::move(ids), n_main, n_main + n_ckpt + n_draft, why);
+        disk->add_streamed(id, std::move(ids), n_main, n_main + n_ckpt + n_draft, why, slot.prompt.key, slot.prompt.t_proc);
         return true;
     }
 
@@ -3230,14 +3230,67 @@ private:
                     if (prompt_cache) {
                         json ram = json::array();
                         for (const auto & st : prompt_cache->states) {
-                            ram.push_back({{"n_tokens", st.prompt.n_tokens()}, {"bytes", st.size()}, {"checkpoints", st.prompt.checkpoints.size()}});
+                            ram.push_back({{"key", st.prompt.key}, {"t_proc", st.prompt.t_proc}, {"n_tokens", st.prompt.n_tokens()},
+                                           {"bytes", st.size()}, {"checkpoints", st.prompt.checkpoints.size()}});
                         }
                         j["ram"] = {{"entries", ram}, {"bytes", prompt_cache->size_states()}, {"limit_bytes", prompt_cache->limit_size}};
                     }
                     j["disk"] = disk ? disk->to_json() : json();
+                    {
+                        // the slots' own states: a chat he is in, or one left in an idle slot (the cache view)
+                        json sl = json::array();
+                        for (const auto & slot : slots) {
+                            sl.push_back({{"id_slot", slot.id}, {"key", slot.prompt.key}, {"t_proc", slot.prompt.t_proc},
+                                          {"n_tokens", slot.prompt.n_tokens()}, {"is_processing", slot.is_processing()}});
+                        }
+                        j["slots"] = sl;
+                    }
                     auto res = std::make_unique<server_task_result_slots>();
                     res->id         = task.id;
                     res->slots_data = std::move(j);
+                    queue_results.send(std::move(res));
+                } break;
+            case SERVER_TASK_TYPE_PROMPT_CACHE_FORGET:
+                {
+                    // POST /prompt-cache/forget {"key": K}: the chat was deleted — its states leave the RAM tier (for good,
+                    // not to disk), the disk tier (files), the writer's queue, and any idle slot holding it (an idle flush
+                    // would have written it back). A slot mid-request on the key is left to finish; its state is then an
+                    // idle slot's, dropped by the next forget or superseded like any other.
+                    if (!task.slot_action.filename.empty()) {
+                        // {"id": I}: one disk entry by its file id — the states written before THE KEY carry no key;
+                        // the one-time cleanup (and a cache view's "drop") name them this way
+                        const std::string & id = task.slot_action.filename;
+                        const bool had = disk && disk->contains(id);
+                        if (had) {
+                            disk->drop(id, "forgotten by id");
+                        }
+                        auto res = std::make_unique<server_task_result_slots>();
+                        res->id = task.id;
+                        res->slots_data = {{"id", id}, {"dropped", had}};
+                        queue_results.send(std::move(res));
+                        break;
+                    }
+                    const std::string key = task.cache_key;
+                    const size_t n_ram  = prompt_cache ? prompt_cache->forget_key(key) : 0;
+                    const size_t n_disk = disk ? disk->forget_key(key) : 0;
+                    int n_slots = 0, n_busy = 0;
+                    for (auto & slot : slots) {
+                        if (slot.prompt.key != key || slot.prompt.n_tokens() == 0) {
+                            continue;
+                        }
+                        if (slot.is_processing()) {
+                            n_busy++;
+                            continue;
+                        }
+                        SLT_INF(slot, "prompt-cache: the slot held key %s (%d tokens) — cleared, the chat was forgotten\n", key.c_str(), slot.prompt.n_tokens());
+                        slot.prompt_clear();
+                        n_slots++;
+                    }
+                    SRV_INF("prompt-cache: key %s forgotten — %zu RAM state(s), %zu on disk or queued, %d slot(s) cleared%s\n",
+                            key.c_str(), n_ram, n_disk, n_slots, n_busy ? " (one slot mid-request on it was left to finish)" : "");
+                    auto res = std::make_unique<server_task_result_slots>();
+                    res->id = task.id;
+                    res->slots_data = {{"key", key}, {"ram", n_ram}, {"disk", n_disk}, {"slots", n_slots}, {"busy", n_busy}};
                     queue_results.send(std::move(res));
                 } break;
             case SERVER_TASK_TYPE_PROMPT_CACHE_FLUSH:
@@ -4161,6 +4214,12 @@ private:
 
                         slot.prompt.tokens.keep_first(n_past);
 
+                        // THE KEY: from here the slot's state is this request's conversation (the kept prefix and
+                        // what is read now) — named and dated for the tiers' one-state-per-key rule
+                        slot.prompt.key    = slot.task->cache_key;
+                        slot.prompt.t_proc = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                                 std::chrono::system_clock::now().time_since_epoch()).count();
+
                         // this is to signal the client that the request has started processing
                         if (slot.task->params.stream) {
                             if (slot.task->params.return_progress) {
@@ -5064,6 +5123,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             task.params.message_spans = task.tokens.find_message_spans(delimiters);
 
             task.id_slot = json_value(data, "id_slot", -1);
+            task.cache_key = json_value(data, "prompt_cache_key", std::string());   // THE KEY: the chat this request belongs to
             sse_ping_interval = task.params.sse_ping_interval;
 
             if (task.id_slot < -1 || task.id_slot >= params.n_parallel) {
@@ -5569,6 +5629,43 @@ void server_routes::init_routes() {
             task.id = res->rd.get_new_id();
             task.id_slot = id_slot;                 // pinned, so it queues behind that slot's own work
             task.slot_action.id_slot = id_slot;
+            res->rd.post_task(std::move(task));
+        }
+        auto result = res->rd.next(req.should_stop);
+        if (!result) {
+            GGML_ASSERT(req.should_stop());
+            return res;
+        }
+        if (result->is_error()) {
+            res->error(result->to_json());
+            return res;
+        }
+        auto * res_task = dynamic_cast<server_task_result_slots*>(result.get());
+        GGML_ASSERT(res_task != nullptr);
+        res->ok(res_task->to_json());
+        return res;
+    };
+
+    this->post_prompt_cache_forget = [this](const server_http_req & req) {
+        auto res = create_response();
+        std::string key, id;
+        try {
+            const json body = req.body.empty() ? json::object() : json::parse(req.body);
+            key = body.value("key", std::string());
+            id  = body.value("id", std::string());
+        } catch (const std::exception & e) {
+            res->error(format_error_response(std::string("invalid body: ") + e.what(), ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        if (key.empty() && id.empty()) {
+            res->error(format_error_response("key (a conversation) or id (a disk entry) is required", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        {
+            server_task task(SERVER_TASK_TYPE_PROMPT_CACHE_FORGET);
+            task.id = res->rd.get_new_id();
+            task.cache_key = key;
+            task.slot_action.filename = id;   // a disk entry's id, when the body names one
             res->rd.post_task(std::move(task));
         }
         auto result = res->rd.next(req.should_stop);

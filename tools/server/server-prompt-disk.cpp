@@ -269,7 +269,20 @@ bool server_prompt_cache_disk::is_protected_locked(const server_prompt_disk_entr
 static constexpr size_t SUPERSEDE_TAIL = 256;
 
 static bool supersedes(const server_prompt_disk_entry & newer, const server_prompt_disk_entry & older) {
-    if (newer.id == older.id || newer.tokens.size() <= older.tokens.size() || older.tokens.size() == 0) {
+    if (newer.id == older.id) {
+        return false;
+    }
+    // THE KEY (2026-10-12 20:xx, live: 42 states for a dozen chats — the same chat under three heads, a state carrying
+    // the generated thinking next to the one carrying it as rendered, 17 of one test chat differing in a clock line):
+    // two states of one conversation are versions of it, and the newer processed one is the conversation — whatever
+    // their lengths or tails. Named states never fall to the token rule between themselves.
+    if (!newer.key.empty() && newer.key == older.key) {
+        return newer.t_proc > older.t_proc;
+    }
+    if (!newer.key.empty() && !older.key.empty()) {
+        return false;   // two named conversations are two conversations
+    }
+    if (newer.tokens.size() <= older.tokens.size() || older.tokens.size() == 0) {
         return false;
     }
     const size_t lcp = older.tokens.get_common_prefix(newer.tokens);
@@ -351,6 +364,8 @@ bool server_prompt_cache_disk::write_manifest(const server_prompt_disk_entry & e
         {"format", 1},
         {"env", env},
         {"id", e.id},
+        {"key", e.key},
+        {"t_proc", e.t_proc},
         {"n_tokens", (int) e.tokens.size()},
         {"bytes", {{"main", (uint64_t) main_bytes}, {"draft", (uint64_t) draft_bytes}}},
         {"checkpoints", ck},
@@ -385,6 +400,19 @@ void server_prompt_cache_disk::register_entry(server_prompt_disk_entry && e, boo
     std::vector<server_prompt_disk_entry> victims;
     {
         std::lock_guard<std::mutex> lock(m);
+        // THE KEY: forgotten while under write — the files go, the row is never made
+        if (!e.key.empty()) {
+            auto f = std::find(forgotten.begin(), forgotten.end(), e.key);
+            if (f != forgotten.end()) {
+                forgotten.erase(f);
+                std::error_code ec;
+                fs::remove(fs::u8path(path_json(e.id)), ec);
+                fs::remove(fs::u8path(path_main(e.id)), ec);
+                fs::remove(fs::u8path(path_draft(e.id)), ec);
+                SRV_INF("prompt-cache disk: dropped id=%s key=%s why=forgotten-under-write\n", e.id.c_str(), e.key.c_str());
+                return;
+            }
+        }
         // the same id again (a rewrite): replace the row
         for (auto it = entries.begin(); it != entries.end(); ++it) {
             if (it->id == e.id) {
@@ -421,6 +449,25 @@ bool server_prompt_cache_disk::offer(server_prompt_cache_state && st, std::vecto
         std::lock_guard<std::mutex> lock(m);
         if (stop) {
             return false;
+        }
+        // THE KEY: a state evicted from RAM after a newer state of its chat already reached the tier (or its queue) is
+        // stale — not written. And the queued older states of this key are dropped before they cost a write.
+        if (!st.prompt.key.empty()) {
+            if (newer_of_key_locked(st.prompt.key, st.prompt.t_proc)) {
+                SRV_INF("prompt-cache disk: refused id=%s key=%s tokens=%zu why=stale (a newer state of the key is on the tier) [%s]\n",
+                        id.c_str(), st.prompt.key.c_str(), n_tokens, why);
+                return false;
+            }
+            for (auto it = queue.begin(); it != queue.end();) {
+                if (it->st.prompt.key == st.prompt.key && it->st.prompt.t_proc < st.prompt.t_proc) {
+                    SRV_INF("prompt-cache disk: a queued older state of key %s (%d tokens) is superseded before its write\n",
+                            st.prompt.key.c_str(), it->st.prompt.n_tokens());
+                    in_flight -= it->bytes;
+                    it = queue.erase(it);
+                } else {
+                    ++it;
+                }
+            }
         }
         in_flight += bytes;
         queue.push_back(job{std::move(st), std::move(packed), id, why, bytes});
@@ -480,12 +527,14 @@ bool server_prompt_cache_disk::write_one(job & j) {
     e.bytes      = n_main + n_ckpt + n_draft;
     e.created_at = e.used_at = now_s();
     e.why        = j.why;
+    e.key        = j.st.prompt.key;
+    e.t_proc     = j.st.prompt.t_proc;
     const size_t n_tokens = e.tokens.size();
     const size_t bytes    = e.bytes;
     const size_t n_ck     = e.checkpoints.size();
     register_entry(std::move(e), true);
-    SRV_INF("prompt-cache disk: saved id=%s tokens=%zu bytes=%zu ckpts=%zu draft=%zu t=%.0fms why=%s\n",
-            j.id.c_str(), n_tokens, bytes, n_ck, n_draft, (ggml_time_us() - t0) / 1000.0, j.why);
+    SRV_INF("prompt-cache disk: saved id=%s key=%s tokens=%zu bytes=%zu ckpts=%zu draft=%zu t=%.0fms why=%s\n",
+            j.id.c_str(), j.st.prompt.key.c_str(), n_tokens, bytes, n_ck, n_draft, (ggml_time_us() - t0) / 1000.0, j.why);
     return true;
 }
 
@@ -625,9 +674,12 @@ bool server_prompt_cache_disk::load_inflight(const std::string & id, server_prom
     return true;
 }
 
-void server_prompt_cache_disk::add_streamed(const std::string & id, llama_tokens && packed, size_t payload_end, size_t bytes, const char * why) {
+void server_prompt_cache_disk::add_streamed(const std::string & id, llama_tokens && packed, size_t payload_end, size_t bytes, const char * why,
+                                           const std::string & key, int64_t t_proc) {
     server_prompt_disk_entry e;
     e.id = id;
+    e.key = key;
+    e.t_proc = t_proc;
     try {
         e.tokens = server_tokens::deserialize(packed, has_mtmd);
     } catch (const std::exception & ex) {
@@ -641,7 +693,7 @@ void server_prompt_cache_disk::add_streamed(const std::string & id, llama_tokens
     const size_t n_tokens = e.tokens.size();
     const size_t n_ck     = e.checkpoints.size();
     register_entry(std::move(e), true);
-    SRV_INF("prompt-cache disk: saved id=%s tokens=%zu bytes=%zu ckpts=%zu (streamed) why=%s\n", id.c_str(), n_tokens, bytes, n_ck, why);
+    SRV_INF("prompt-cache disk: saved id=%s key=%s tokens=%zu bytes=%zu ckpts=%zu (streamed) why=%s\n", id.c_str(), key.c_str(), n_tokens, bytes, n_ck, why);
 }
 
 void server_prompt_cache_disk::scan() {
@@ -723,6 +775,8 @@ void server_prompt_cache_disk::scan() {
         e.created_at = j.value("created_at", now_s());
         e.used_at    = j.value("used_at", now_s());
         e.why        = j.value("why", "");
+        e.key        = j.value("key", "");
+        e.t_proc     = j.value("t_proc", (int64_t) 0);
         found.push_back(std::move(e));
         n_ok++;
     }
@@ -835,6 +889,63 @@ void server_prompt_cache_disk::drop(const std::string & id, const char * why) {
     SRV_WRN("prompt-cache disk: dropped id=%s why=%s\n", id.c_str(), why);
 }
 
+bool server_prompt_cache_disk::newer_of_key_locked(const std::string & key, int64_t t_proc) const {
+    for (const auto & e : entries) {
+        if (e.key == key && e.t_proc > t_proc) {
+            return true;
+        }
+    }
+    for (const auto & j : queue) {
+        if (j.st.prompt.key == key && j.st.prompt.t_proc > t_proc) {
+            return true;
+        }
+    }
+    if (writing != nullptr && writing->st.prompt.key == key && writing->st.prompt.t_proc > t_proc) {
+        return true;
+    }
+    return false;
+}
+
+size_t server_prompt_cache_disk::forget_key(const std::string & key) {
+    if (key.empty()) {
+        return 0;
+    }
+    std::vector<server_prompt_disk_entry> victims;
+    size_t n_queued = 0;
+    {
+        std::lock_guard<std::mutex> lock(m);
+        for (auto it = entries.begin(); it != entries.end();) {
+            if (it->key == key) {
+                it->why = "forgotten";
+                victims.push_back(std::move(*it));
+                it = entries.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        for (auto it = queue.begin(); it != queue.end();) {
+            if (it->st.prompt.key == key) {
+                in_flight -= it->bytes;
+                it = queue.erase(it);
+                n_queued++;
+            } else {
+                ++it;
+            }
+        }
+        if (writing != nullptr && writing->st.prompt.key == key) {
+            forgotten.push_back(key);   // it lands, then it goes (register_entry)
+        }
+    }
+    for (const auto & v : victims) {
+        std::error_code ec;
+        fs::remove(fs::u8path(path_json(v.id)), ec);
+        fs::remove(fs::u8path(path_main(v.id)), ec);
+        fs::remove(fs::u8path(path_draft(v.id)), ec);
+        SRV_INF("prompt-cache disk: evicted id=%s key=%s tokens=%zu bytes=%zu why=forgotten\n", v.id.c_str(), key.c_str(), v.tokens.size(), v.bytes);
+    }
+    return victims.size() + n_queued;
+}
+
 void server_prompt_cache_disk::set_held(const std::string & id) {
     std::lock_guard<std::mutex> lock(m);
     held_id = id;
@@ -860,7 +971,8 @@ json server_prompt_cache_disk::to_json() const {
     json rows = json::array();
     for (const auto & e : entries) {
         rows.push_back({
-            {"id", e.id}, {"n_tokens", (int) e.tokens.size()}, {"bytes", e.bytes}, {"checkpoints", e.checkpoints.size()},
+            {"id", e.id}, {"key", e.key}, {"t_proc", e.t_proc}, {"n_tokens", (int) e.tokens.size()}, {"bytes", e.bytes},
+            {"checkpoints", e.checkpoints.size()},
             {"created_at", e.created_at}, {"used_at", e.used_at}, {"why", e.why}, {"protected", is_protected_locked(e)},
         });
     }
