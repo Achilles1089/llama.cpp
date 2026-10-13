@@ -76,6 +76,8 @@ struct server_prompt_disk_entry {
     int64_t created_at = 0;
     int64_t used_at    = 0;
     std::string why;
+    std::string key;                                        // THE KEY: the conversation (server_prompt::key), "" = unnamed
+    int64_t     t_proc = 0;                                 // when its prompt was processed (ms) — the newest of a key wins
 };
 
 struct server_prompt_disk_score {
@@ -111,7 +113,8 @@ public:
     bool offer(server_prompt_cache_state && st, std::vector<char> && packed, const char * why);
 
     // a state the main thread streamed from a slot straight to <id>.bin / .draft (too big for a RAM copy): register it
-    void add_streamed(const std::string & id, llama_tokens && packed, size_t payload_end, size_t bytes, const char * why);
+    void add_streamed(const std::string & id, llama_tokens && packed, size_t payload_end, size_t bytes, const char * why,
+                      const std::string & key, int64_t t_proc);
 
     // bytes handed to the writer and not yet on disk — the RAM tier counts them against its limit
     size_t in_flight_bytes() const { return in_flight.load(); }
@@ -129,6 +132,10 @@ public:
     bool contains(const std::string & id) const;
     void touch(const std::string & id);
     void drop(const std::string & id, const char * why);
+
+    // THE KEY: every state of `key` leaves the tier — the entries (files deleted), the queued writes, and the write in
+    // progress once it lands. Returns how many entries and queued jobs went.
+    size_t forget_key(const std::string & key);
 
     // the reserved slot's current prompt: entries that are a prefix of it are never evicted
     void set_protected(server_tokens && tokens);
@@ -182,6 +189,8 @@ private:
     std::condition_variable cv;
     std::deque<job> queue;
     const job * writing = nullptr;   // the job under write (the writer's local), readable under `m` while it is set
+    std::vector<std::string> forgotten;   // keys forgotten while their state was under write: dropped when it lands
+    bool newer_of_key_locked(const std::string & key, int64_t t_proc) const;   // an entry or a queued job of `key` newer than t_proc
     std::thread writer;
     bool stop = false;
     std::atomic<size_t> in_flight{0};

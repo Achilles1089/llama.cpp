@@ -17,6 +17,7 @@ enum server_task_type {
     SERVER_TASK_TYPE_COMPLETION,
     SERVER_TASK_TYPE_PROMPT_CACHE_GET,     // GET /prompt-cache: the hot set and the disk set (read-only, allowed while decoding)
     SERVER_TASK_TYPE_PROMPT_CACHE_FLUSH,   // the idle flush: idle slots to the disk tier
+    SERVER_TASK_TYPE_PROMPT_CACHE_FORGET,  // POST /prompt-cache/forget {"key"}: a conversation's states leave both tiers and the idle slots
     SERVER_TASK_TYPE_EMBEDDING,
     SERVER_TASK_TYPE_RERANK,
     SERVER_TASK_TYPE_DECISION,
@@ -146,6 +147,11 @@ struct server_task {
     // used by SERVER_TASK_TYPE_CANCEL
     int id_target = -1;
     int id_slot   = -1;
+
+    // THE KEY (2026-10-12, "is it holding old ones?" — 42 states for a dozen chats): the conversation this request
+    // belongs to, named by the client (`prompt_cache_key`, a chat id). The lead keeps ONE state per key across the RAM
+    // and disk tiers — the newest processed — and drops a key's states on request. "" = unnamed: the token rules alone.
+    std::string cache_key;
 
     // used by parallel sampling (multiple completions from same prompt)
     int id_parent  = -1;
@@ -622,9 +628,16 @@ struct server_prompt {
 
     std::list<common_prompt_checkpoint> checkpoints;
 
+    // THE KEY: whose conversation this state is (the request's prompt_cache_key when its prompt was processed) and
+    // when (wall clock, ms) — the newest state of a key supersedes the others, whatever their lengths
+    std::string key;
+    int64_t     t_proc = 0;
+
     void clear() {
         tokens.clear();
         checkpoints.clear();
+        key.clear();
+        t_proc = 0;
     }
 
     int n_tokens() const {
@@ -635,6 +648,8 @@ struct server_prompt {
         return server_prompt {
             tokens.clone(),
             checkpoints,
+            key,
+            t_proc,
         };
     }
 };
@@ -693,6 +708,9 @@ struct server_prompt_cache {
 
     // the oldest state leaves RAM — to the disk tier when there is one
     void evict_front(const char * why);
+
+    // THE KEY: every state of `key` leaves RAM for good (not to the disk tier) — a deleted chat; returns how many
+    size_t forget_key(const std::string & key);
 
     // find a cached state that is a better starting point than `prompt` for `tokens_new`
     std::list<server_prompt_cache_state>::iterator find_better(const server_prompt & prompt, const server_tokens & tokens_new);

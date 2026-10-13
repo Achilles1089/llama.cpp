@@ -1720,6 +1720,24 @@ void server_prompt_cache::evict_front(const char * why) {
     }
 }
 
+size_t server_prompt_cache::forget_key(const std::string & key) {
+    size_t n = 0;
+    if (key.empty()) {
+        return 0;
+    }
+    for (auto it = states.begin(); it != states.end();) {
+        if (it->prompt.key == key) {
+            SRV_INF(" - prompt cache: the state of key %s (%d tokens, %.3f MiB) leaves RAM — forgotten\n",
+                    key.c_str(), it->prompt.n_tokens(), it->size() / (1024.0 * 1024.0));
+            it = states.erase(it);
+            n++;
+        } else {
+            ++it;
+        }
+    }
+    return n;
+}
+
 size_t server_prompt_cache::n_tokens() const {
     size_t res = 0;
 
@@ -1759,6 +1777,26 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
                 state_size_new / (1024.0 * 1024.0), limit_size / (1024.0 * 1024.0), on_evict ? "to the disk tier" : "skipping");
         set(ALLOC_OVER_LIMIT);
         return nullptr;
+    }
+
+    // THE KEY: one state per conversation. An older state of this key is superseded by the one being saved — it leaves
+    // RAM for good, never to the disk tier (it is the same chat, and this one is newer). A NEWER state of the key
+    // already here (two slots on one chat — the daemon never does it) keeps its place: this one is not saved.
+    if (!prompt.key.empty()) {
+        for (auto it = states.begin(); it != states.end();) {
+            if (it->prompt.key == prompt.key) {
+                if (it->prompt.t_proc > prompt.t_proc) {
+                    SRV_INF(" - prompt cache: a newer state of key %s is already cached — this one is not saved\n", prompt.key.c_str());
+                    set(ALLOC_CACHED);
+                    return nullptr;
+                }
+                SRV_INF(" - prompt cache: the older state of key %s (%d tokens) is superseded by the one saved (%d tokens)\n",
+                        prompt.key.c_str(), it->prompt.n_tokens(), prompt.n_tokens());
+                it = states.erase(it);
+            } else {
+                ++it;
+            }
+        }
     }
 
     // remove any cached prompts that are fully contained in the current prompt
@@ -1810,6 +1848,8 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         /*.prompt =*/ {
             /*.tokens      =*/ prompt.tokens.clone(),
             /*.checkpoints =*/ prompt.checkpoints,
+            /*.key         =*/ prompt.key,
+            /*.t_proc      =*/ prompt.t_proc,
         },
         /*.data   =*/ {
             /*.main =*/ std::move(state_data_tgt),

@@ -591,7 +591,8 @@ json server_chat_convert_anthropic_to_oai(const json & body) {
 
     // Pass through common params
     // id_slot is llama.cpp-specific: it pins the request to a slot, like on /v1/chat/completions
-    for (const auto & key : {"temperature", "top_p", "top_k", "stream", "chat_template_kwargs", "id_slot"}) {
+    // prompt_cache_key names the conversation for the prompt cache's one-state-per-chat rule (server-task.h, THE KEY)
+    for (const auto & key : {"temperature", "top_p", "top_k", "stream", "chat_template_kwargs", "id_slot", "prompt_cache_key"}) {
         if (body.contains(key)) {
             oai_body[key] = body.at(key);
         }

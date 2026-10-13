@@ -135,6 +135,7 @@ struct server_routes {
     server_http_context::handler_t post_slots;
     server_http_context::handler_t get_prompt_cache;
     server_http_context::handler_t post_prompt_cache_flush;
+    server_http_context::handler_t post_prompt_cache_forget;
     server_http_context::handler_t get_props;
     server_http_context::handler_t post_props;
     server_http_context::handler_t post_infill;
