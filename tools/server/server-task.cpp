@@ -1709,6 +1709,9 @@ void server_prompt_cache::evict_front(const char * why) {
     if (states.empty()) {
         return;
     }
+    if (held == &states.front()) {
+        held = nullptr;   // forced out anyway (a limit shrink): no dangling hold
+    }
     SRV_WRN(" - prompt cache: the oldest entry leaves RAM (%d tokens, %.3f MiB) [%s]%s\n",
             states.front().prompt.n_tokens(), states.front().size() / (1024.0 * 1024.0), why, on_evict ? " - to the disk tier" : "");
     if (on_evict) {
@@ -1813,12 +1816,26 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     }
 
     if (limit_size > 0) {
-        // make room before allocating the new vectors to avoid breaching the limit
+        // the held entry (hold_better) stays whatever this save needs: evicting cannot free the bytes in flight to the
+        // disk tier, so when the new state cannot fit beside the held one and what is in flight, nothing is evicted —
+        // the slot streams its state to disk instead (the caller's ALLOC_NO_HEADROOM path)
+        const size_t held_size = held ? held->size() : 0;
+        const size_t fly       = in_flight ? in_flight() : 0;
+        if (fly + held_size + state_size_new > limit_size) {
+            SRV_WRN(" - prompt cache: no room for a %.3f MiB state beside the held entry (%.3f MiB) and %.3f MiB in flight — streamed\n",
+                    state_size_new / (1024.0 * 1024.0), held_size / (1024.0 * 1024.0), fly / (1024.0 * 1024.0));
+            set(ALLOC_NO_HEADROOM);
+            return nullptr;
+        }
+        // make room before allocating the new vectors to avoid breaching the limit — never the held entry
         while (!states.empty() && size() + state_size_new > limit_size) {
+            if (held != nullptr && &states.front() == held) {
+                break;
+            }
             evict_front("ram-full");
         }
-        if (states.empty() && size() + state_size_new > limit_size) {
-            // only bytes in flight to the disk tier are left: no room for a RAM copy right now
+        if (size() + state_size_new > limit_size) {
+            // only the held entry and bytes in flight to the disk tier are left: no room for a RAM copy right now
             set(ALLOC_NO_HEADROOM);
             return nullptr;
         }
@@ -1910,9 +1927,11 @@ bool server_prompt_cache::has_better(const server_prompt & prompt, const server_
 }
 
 void server_prompt_cache::hold_better(const server_prompt & prompt, const server_tokens & tokens_new) {
+    held = nullptr;
     const auto it = find_better(prompt, tokens_new);
     if (it != states.end()) {
         states.splice(states.end(), states, it);
+        held = &states.back();   // a list node's address is stable until it is erased (load) or evicted
     }
 }
 
@@ -1974,6 +1993,9 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 
         prompt = std::move(it_best->prompt);
 
+        if (held == &*it_best) {
+            held = nullptr;
+        }
         states.erase(it_best);
     }
 
@@ -1981,6 +2003,7 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 }
 
 void server_prompt_cache::update() {
+    held = nullptr;   // the hold lasts from hold_better to the load that follows it
     if (limit_size > 0) {
         while (!states.empty() && size() > limit_size) {
             evict_front("ram-limit");
