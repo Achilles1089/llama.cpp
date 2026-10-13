@@ -642,6 +642,11 @@ struct server_prompt_cache {
 
     std::list<server_prompt_cache_state> states;
 
+    // LAW 3 MADE REAL (2026-10-12 21:5x, live S6: a 6.7 GB save into the 16 GB tier evicted every entry, the one just
+    // chosen to load among them — 9,797 tokens re-read, 50 s): the entry hold_better chose is never evicted by the save
+    // that precedes its load; a save that cannot fit beside it streams to disk instead (ALLOC_NO_HEADROOM)
+    const server_prompt_cache_state * held = nullptr;
+
     // in bytes, 0 = no limit
     size_t limit_size = 0;
 

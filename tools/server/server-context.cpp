@@ -1778,13 +1778,24 @@ private:
                                        : ret->prompt_load(*prompt_cache, task.tokens);
                     if (!from_ram) {
                         // the chosen RAM state is gone (the save above still evicted it, or the load failed): the
-                        // disk tier is asked again — evicted states are on their way there — and the slot starts
-                        // from the best it finds, never from nothing while a state of this chat exists
-                        from_disk = disk && disk->find_better(ret->prompt, task.tokens, ret->n_ctx, disk_hit);
-                        SLT_WRN(*ret, "prompt-cache: the RAM state chosen to load is gone — %s\n",
-                                from_disk ? "the disk tier loads instead" : "nothing else fits: a cold read");
-                        if (!from_disk) {
-                            ret->prompt_clear();
+                        // writer's queue is asked first — an evicted state is in its hands for seconds (21:5x, live:
+                        // the fallback asked only the SSD and read 9,797 tokens while the state sat in the queue) —
+                        // then the disk tier; the slot starts from the best it finds, never from nothing while a
+                        // state of this chat exists
+                        server_prompt_disk_hit fly2;
+                        const bool fly2_ok = disk && disk->find_better_inflight(ret->prompt, task.tokens, ret->n_ctx, fly2)
+                                          && disk->load_inflight(fly2.id, ret->prompt, ret->ctx_tgt, ret->ctx_dft, ret->id);
+                        if (fly2_ok) {
+                            from_ram = true;
+                            SLT_WRN(*ret, "prompt-cache: the RAM state chosen to load is gone — a state in the writer's hands loads instead (resume %d)\n",
+                                    fly2.score.resume);
+                        } else {
+                            from_disk = disk && disk->find_better(ret->prompt, task.tokens, ret->n_ctx, disk_hit);
+                            SLT_WRN(*ret, "prompt-cache: the RAM state chosen to load is gone — %s\n",
+                                    from_disk ? "the disk tier loads instead" : "nothing else fits: a cold read");
+                            if (!from_disk) {
+                                ret->prompt_clear();
+                            }
                         }
                     }
                 }
