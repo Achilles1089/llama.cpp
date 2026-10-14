@@ -1953,8 +1953,45 @@ int server_prompt_cache::best_resume(const server_prompt & prompt, const server_
     return resume;
 }
 
-bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
+bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot,
+                               const std::string & key) {
     auto it_best = find_better(prompt, tokens_new);
+
+    // A STATE IS LENT, NEVER TAKEN, ACROSS CHATS (Raven, 2026-10-14 00:0x, live probe): a request of chat B that shares
+    // only the head with chat A's saved state MOVED A's state into its slot — the entry erased, its KV cut back to the
+    // shared head and overwritten with B — so A's next turn read its whole conversation again. Every new chat, schedule
+    // run or job on a shared head did that to one of his chats. A state named for ANOTHER key is now copied into the slot
+    // and stays in the tier; a chat's own older state (same key) and an unnamed one move, as before.
+    if (it_best != states.end() && !it_best->prompt.key.empty() && it_best->prompt.key != key) {
+        {
+            auto & data = it_best->data.main;
+            const size_t size = data.size();
+            const size_t n = llama_state_seq_set_data_ext(ctx_tgt, data.data(), size, id_slot, 0);
+            if (n != size) {
+                SRV_ERR("failed to restore state with size %zu\n", size);
+                return false;
+            }
+        }
+        {
+            auto & data = it_best->data.drft;
+            if (!data.empty()) {
+                GGML_ASSERT(ctx_dft);
+                const size_t size = data.size();
+                const size_t n = llama_state_seq_set_data_ext(ctx_dft, data.data(), size, id_slot, 0);
+                if (n != size) {
+                    SRV_WRN("failed to restore state with size %zu\n", size);
+                    return false;
+                }
+            }
+        }
+        prompt = it_best->prompt.clone();
+        SRV_INF("prompt-cache: the state of key %s (%d tokens) lent to key %s — copied, kept in the RAM tier\n",
+                it_best->prompt.key.c_str(), it_best->prompt.n_tokens(), key.empty() ? "(unnamed)" : key.c_str());
+        if (held == &*it_best) {
+            held = nullptr;
+        }
+        return true;
+    }
 
     if (it_best != states.end()) {
         {

@@ -337,8 +337,8 @@ struct server_slot {
         return true;
     }
 
-    bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens) {
-        bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id);
+    bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens, const std::string & key = std::string()) {
+        bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id, key);
         if (!res) {
             SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
         }
@@ -1966,7 +1966,7 @@ private:
                 bool from_disk  = disk_wins;
                 if (ram_better && !disk_wins) {
                     from_ram = use_fly ? disk->load_inflight(fly_hit.id, ret->prompt, ret->ctx_tgt, ret->ctx_dft, ret->id)
-                                       : ret->prompt_load(*prompt_cache, task.tokens);
+                                       : ret->prompt_load(*prompt_cache, task.tokens, task.cache_key);
                     if (!from_ram) {
                         // the chosen RAM state is gone (the save above still evicted it, or the load failed): the
                         // writer's queue is asked first — an evicted state is in its hands for seconds (21:5x, live:
