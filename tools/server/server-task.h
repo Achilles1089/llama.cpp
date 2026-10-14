@@ -681,7 +681,9 @@ struct server_prompt_cache {
     // evicts from the front, and it must never evict the entry chosen to load (2026-10-12 10:53, live: it did)
     void hold_better(const server_prompt & prompt, const server_tokens & tokens_new);
 
-    bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
+    // `key`: the request's prompt_cache_key — a state that belongs to ANOTHER key is lent (copied, kept), never taken
+    bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot,
+              const std::string & key = std::string());
 
     void update();
 };
