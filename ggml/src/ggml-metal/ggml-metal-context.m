@@ -444,6 +444,10 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
     }
 
     // number of nodes encoded by the main thread (empirically determined)
+    if (gf->n_nodes == 0) {
+        return GGML_STATUS_SUCCESS;
+    }
+
     const int n_main = MAX(64, 0.1*gf->n_nodes);
 
     // number of threads in addition to the main thread
@@ -473,8 +477,6 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
 
         const bool use_capture = ctx->capture_compute == 0;
         if (use_capture) {
-            ctx->capture_compute = -1;
-
             // make sure all previous computations have finished before starting the capture
             if (ctx->cmd_buf_last) {
                 [ctx->cmd_buf_last waitUntilCompleted];
@@ -702,7 +704,7 @@ void ggml_metal_set_n_cb(ggml_metal_t ctx, int n_cb) {
             idx_end,
             ctx->use_fusion,
             ctx->use_concurrency,
-            ctx->capture_compute,
+            ctx->capture_compute == 0,   // a capture of THIS graph (upstream #29390: the -1 counter read as true, so every node of every graph got debug-group markers)
             ctx->debug_graph,
             ctx->debug_fusion);
 

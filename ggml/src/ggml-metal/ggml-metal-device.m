@@ -107,6 +107,7 @@ int ggml_metal_pipeline_max_theads_per_threadgroup(struct ggml_metal_pipeline_wi
 #define GGML_METAL_LIBS \
     X(FA,              fa)             \
     X(MUL_MV,          mul_mv)         \
+    X(MUL_MV_MMA,      mul_mv_mma)     \
     X(MUL_MM,          mul_mm)         \
     X(QUANTIZE,        quantize)       \
     X(SOFTMAX,         softmax)        \

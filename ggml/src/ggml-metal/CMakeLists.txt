@@ -32,6 +32,7 @@ set(METALLIB_KERNELS_QUANTIZE   "${CMAKE_CURRENT_SOURCE_DIR}/kernels/quantize.h"
 set(METALLIB_KERNEL_SOURCES
     kernels/fa.metal
     kernels/mul_mv.metal
+    kernels/mul_mv_mma.metal
     kernels/mul_mm.metal
     kernels/quantize.metal
     kernels/softmax.metal
