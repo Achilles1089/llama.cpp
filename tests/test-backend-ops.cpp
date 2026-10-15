@@ -12017,6 +12017,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
 
+    // RAVEN_FA_PACKED (bench only): the same attention with the 6 grouped heads packed into rows (4 heads x 6*nq rows)
+    for (int64_t kv : {2048, 22528, 45056}) {
+        for (int64_t nb : {6, 18, 30, 42}) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {1, 1}, kv, nb, true, false, 0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+        }
+    }
+    // RAVEN_FA (bench only): Qwen3.8-27B attention, head 256, 4 KV heads x 6, decode and verify, 2k/22.5k/45k context
+    for (int64_t kv : {2048, 22528, 45056}) {
+        for (int64_t nb : {1, 3, 5, 7}) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+        }
+    }
+
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
     // note: same bytes either way, so a backend that indexes them differently shows it here
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_BF16}) {

@@ -46,6 +46,7 @@ set(METALLIB_KERNEL_SOURCES
     kernels/fa_q5_1.metal
     kernels/fa_q8_0.metal
     kernels/fa_vec_f16.metal
+    kernels/fa_gqa.metal
     kernels/fa_vec_f32.metal
     kernels/fa_vec_q4_0.metal
     kernels/fa_vec_q4_1.metal

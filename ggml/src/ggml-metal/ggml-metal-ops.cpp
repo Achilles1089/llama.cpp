@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <limits>
 #include <cmath>
+#include <cstdlib>
 
 // threadgroups needed to fill the GPU
 // TODO: dedup
@@ -4047,6 +4048,117 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
             /*.logit_softcap =*/ logit_softcap,
             /*.n_kv_max_padded =*/ n_kv_max_padded,
         };
+
+        // GQA FLASH-DECODING (kernels/fa_gqa.metal, 2026-10-15): the vec kernel's cost is per (query row x head x key) -
+        // M1 Ultra, Qwen3.8-27B (24 heads on 4 KV heads, head 256) at 45k context: a 7-row speculative verify cost 5.4x a
+        // decode - and the half8x8 kernel has no key split, so a decode launches only a few threadgroups.
+        // kernel_flash_attn_ext_gqa runs the half8x8 math on rows packed by KV group (every head that shares a KV head,
+        // at every query position) with the same key split as the vec kernel; the vec reduce combines the splits.
+        // GGML_METAL_FA_GQA_MIN_KV: the shortest context it takes (default 2048; <= 0 turns it off).
+        {
+            static const int gqa_min_kv = [] {
+                const char * e = getenv("GGML_METAL_FA_GQA_MIN_KV");
+                return e ? atoi(e) : 2048;
+            }();
+
+            constexpr int64_t GQA_Q   = 8;   // packed rows per threadgroup (kernel template)
+            constexpr int64_t GQA_C   = 64;  // keys per block (kernel template)
+            constexpr int32_t GQA_NSG = 4;   // simdgroups per threadgroup (kernel template)
+
+            const int64_t gqa_g = ne12 > 0 ? ne02/ne12 : 0;
+
+            const bool use_gqa = gqa_min_kv > 0 && !use_sparse && !has_sinks && !has_bias && !has_scap &&
+                op->src[1]->type == GGML_TYPE_F16 && op->src[2]->type == GGML_TYPE_F16 &&
+                ne00 == ne20 && (ne00 == 256 || ne00 == 128) &&
+                gqa_g > 1 && ne02 % ne12 == 0 && ne03 % ne13 == 0 &&
+                ne11 >= gqa_min_kv && ne11 % GQA_C == 0 &&
+                (!has_mask || (op->src[3]->type == GGML_TYPE_F16 && ne32 <= 1 && ne31 >= ne01)) &&
+                nb10 == sizeof(ggml_fp16_t) && nb20 == sizeof(ggml_fp16_t) &&
+                nwg > 1 && nwg <= 32;
+
+            if (use_gqa) {
+                const int32_t ns10_gqa = nb11_attn/nb10_attn;
+                const int32_t ns20_gqa = nb21_attn/nb20_attn;
+
+                auto pipeline_gqa = ggml_metal_library_get_pipeline_flash_attn_ext_gqa(lib, op, has_mask, GQA_NSG, nwg, ns10_gqa, ns20_gqa);
+
+                GGML_ASSERT(GQA_NSG*32 <= ggml_metal_pipeline_max_theads_per_threadgroup(pipeline_gqa));
+
+                // the half8x8 kernel's shared memory: Q*(DK + 2*PAD(DV, 64) + 4*C) halfs
+                const size_t smem_gqa = GGML_PAD((size_t) GQA_Q*(ne00 + 2*GGML_PAD(ne20, 64) + 4*GQA_C)*sizeof(ggml_fp16_t), 16);
+                GGML_ASSERT(smem_gqa <= props_dev->max_theadgroup_memory_size);
+
+                assert(ggml_metal_op_flash_attn_ext_extra_tmp(op) != 0);
+                GGML_ASSERT(ne01*ne02*ne03 == ne1*ne2*ne3);
+
+                ggml_metal_kargs_flash_attn_ext args_gqa = {
+                    /*.ne01          =*/ ne01,
+                    /*.ne02          =*/ ne02,
+                    /*.ne03          =*/ ne03,
+                    /*.nb01          =*/ nb01,
+                    /*.nb02          =*/ nb02,
+                    /*.nb03          =*/ nb03,
+                    /*.ne11          =*/ ne11,
+                    /*.ne_12_2       =*/ ne12,
+                    /*.ne_12_3       =*/ ne13,
+                    /*.ns10          =*/ ns10_gqa,
+                    /*.nb11          =*/ nb11_attn,
+                    /*.nb12          =*/ nb12_attn,
+                    /*.nb13          =*/ nb13_attn,
+                    /*.ns20          =*/ ns20_gqa,
+                    /*.nb21          =*/ nb21_attn,
+                    /*.nb22          =*/ nb22_attn,
+                    /*.nb23          =*/ nb23_attn,
+                    /*.ne31          =*/ ne31,
+                    /*.ne32          =*/ ne32,
+                    /*.ne33          =*/ ne33,
+                    /*.nb31          =*/ nb31,
+                    /*.nb32          =*/ nb32,
+                    /*.nb33          =*/ nb33,
+                    /*.ne1           =*/ ne1,
+                    /*.ne2           =*/ ne2,
+                    /*.ne3           =*/ ne3,
+                    /*.scale         =*/ scale,
+                    /*.max_bias      =*/ max_bias,
+                    /*.m0            =*/ m0,
+                    /*.m1            =*/ m1,
+                    /*.n_head_log2   =*/ n_head_log2,
+                    /*.logit_softcap =*/ logit_softcap,
+                };
+
+                ggml_metal_encoder_set_pipeline(enc, pipeline_gqa);
+                ggml_metal_encoder_set_bytes   (enc, &args_gqa, sizeof(args_gqa), 0);
+                ggml_metal_encoder_set_buffer  (enc, bid_src0, 1);
+                ggml_metal_encoder_set_buffer  (enc, bid_k,    2);
+                ggml_metal_encoder_set_buffer  (enc, bid_v,    3);
+                ggml_metal_encoder_set_buffer  (enc, bid_src3, 4);
+                ggml_metal_encoder_set_buffer  (enc, bid_tmp,  5);
+
+                ggml_metal_encoder_set_threadgroup_memory_size(enc, smem_gqa, 0);
+                ggml_metal_encoder_dispatch_threadgroups(enc, (gqa_g*ne01 + GQA_Q - 1)/GQA_Q, ne12, ne03*nwg, 32, GQA_NSG, 1);
+
+                ggml_metal_op_concurrency_reset(ctx);
+
+                {
+                    const int32_t nrows = ne1*ne2*ne3;
+
+                    ggml_metal_kargs_flash_attn_ext_vec_reduce args0 = {
+                        nrows,
+                    };
+
+                    auto pipeline0 = ggml_metal_library_get_pipeline_flash_attn_ext_vec_reduce(lib, op, ne20, nwg);
+
+                    ggml_metal_encoder_set_pipeline(enc, pipeline0);
+                    ggml_metal_encoder_set_bytes   (enc, &args0, sizeof(args0), 0);
+                    ggml_metal_encoder_set_buffer  (enc, bid_tmp, 1);
+                    ggml_metal_encoder_set_buffer  (enc, bid_dst, 2);
+
+                    ggml_metal_encoder_dispatch_threadgroups(enc, nrows, 1, 1, 32*nwg, 1, 1);
+                }
+
+                return 1;
+            }
+        }
 
         auto pipeline = ggml_metal_library_get_pipeline_flash_attn_ext_vec(lib, op, has_mask, has_sinks, has_bias, has_scap, has_kvpad, use_sparse, nqptg, cfg.NE, nsg, nwg, use_kv_f16, ns10, ns20);
 
