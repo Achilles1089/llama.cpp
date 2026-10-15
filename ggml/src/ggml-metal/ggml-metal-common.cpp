@@ -1,4 +1,6 @@
 #include "ggml-metal-common.h"
+
+#include <cstdlib>
 #include "ggml-metal-fusion.h"
 
 #include "ggml.h"
@@ -118,7 +120,15 @@ static bool ggml_metal_mul_mat_mma_type_ok(const struct ggml_tensor * op) {
 }
 
 // the fewest src1 rows at which the few-row MMA kernels beat the mat-vec kernels (measured on an M3 Ultra)
+// GGML_METAL_MMA_ROWS_MIN overrides it for every type (tuning)
 static int64_t ggml_metal_mul_mv_mma_rows_min(enum ggml_type type) {
+    static const int64_t rows_min_env = [] {
+        const char * e = getenv("GGML_METAL_MMA_ROWS_MIN");
+        return e ? (int64_t) atoi(e) : (int64_t) 0;
+    }();
+    if (rows_min_env > 0) {
+        return rows_min_env;
+    }
     switch (type) {
         case GGML_TYPE_F32:
             return 6;

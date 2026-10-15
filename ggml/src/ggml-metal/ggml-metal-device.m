@@ -973,8 +973,9 @@ ggml_metal_rsets_t ggml_metal_rsets_init(ggml_metal_device_t dev) {
     res->lock = [[NSLock alloc] init];
     res->data = [[NSMutableArray alloc] init];
 
-    // by default keep the memory wired for 3 minutes
-    res->keep_alive_s = 3*60;
+    // Raven (2026-10-15): 1 hour, not 3 minutes - on an M1 Ultra the first request after the residency lapsed paid
+    // 1.2-2.1 s before its first token (a 4-token request, measured on the live lead every 10 minutes)
+    res->keep_alive_s = 60*60;
 
     const char * GGML_METAL_RESIDENCY_KEEP_ALIVE_S = getenv("GGML_METAL_RESIDENCY_KEEP_ALIVE_S");
     if (GGML_METAL_RESIDENCY_KEEP_ALIVE_S) {
@@ -982,7 +983,7 @@ ggml_metal_rsets_t ggml_metal_rsets_init(ggml_metal_device_t dev) {
     }
 
     if (res->keep_alive_s <= 0) {
-        res->keep_alive_s = 3*60;
+        res->keep_alive_s = 60*60;
     }
 
     res->time_per_loop_ms = 5;

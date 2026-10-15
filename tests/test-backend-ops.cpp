@@ -12017,6 +12017,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
 
+    // RAVEN_MM (bench only): Qwen3.8-27B Q8_0 weight shapes (m = rows out, k = in) at 1..8 activation rows (decode + verify)
+    for (auto [m, k] : { std::pair<int64_t, int64_t>{17408, 5120}, {5120, 17408}, {16384, 5120}, {6144, 5120}, {5120, 6144} }) {
+        for (int64_t n : {1, 2, 3, 4, 5, 6, 7, 8}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, m, n, k, {1, 1}, {1, 1}));
+        }
+    }
     // RAVEN_FA_PACKED (bench only): the same attention with the 6 grouped heads packed into rows (4 heads x 6*nq rows)
     for (int64_t kv : {2048, 22528, 45056}) {
         for (int64_t nb : {6, 18, 30, 42}) {
