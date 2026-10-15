@@ -10775,6 +10775,26 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // Q8_0 few-row mat-vec kernel_mul_mv_q8_0_f32_r1 (routed by GGML_METAL_MV_R1_MAX*): every n of its range, row tails for
+    // NR0*NRG up to 32, one K block, K one block past a threadgroup step, long K, broadcast, permuted and strided batches,
+    // padded src1 rows, a src1 with a mean, and the fused residual in every mode (no strided src0 batch: its padding
+    // is uninitialised Q8_0 blocks, NaN on every backend)
+    for (int64_t n = 2; n <= 8; ++n) {
+        for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{{1, 32}, {7, 64}, {13, 96}, {33, 160}, {100, 1056}, {517, 5120}, {130, 17408}}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, m, n, k, {1, 1}, {1, 1}));
+        }
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 64, n, 256, {3, 2}, {2, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 16, n, 256, {2, 3}, {1, 1}, {0, 1, 3, 2}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 16, n, 256, {2, 3}, {1, 1}, {0, 2, 1, 3}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 1000, n, 1024, {1, 1}, {1, 1}, {0, 1, 2, 3}, 1280));
+        test_cases.emplace_back(new test_mul_mat_pos(GGML_TYPE_Q8_0, GGML_TYPE_F32, 1000, n, 1024, {1, 1}, {1, 1}));
+        for (mul_mat_add_mode mode : {MUL_MAT_ADD_MM_RES, MUL_MAT_ADD_RES_MM, MUL_MAT_ADD_ROW, MUL_MAT_ADD_RES_INPLACE, MUL_MAT_ADD_MM_MM}) {
+            test_cases.emplace_back(new test_mul_mat_add(GGML_TYPE_Q8_0, 1000, n, 1024, mode));
+            test_cases.emplace_back(new test_mul_mat_add(GGML_TYPE_Q8_0,  517, n, 5120, mode));
+        }
+        test_cases.emplace_back(new test_mul_mat_add(GGML_TYPE_Q8_0, 2048, n, 2048, MUL_MAT_ADD_B_INPLACE));
+    }
+
 #if 0
     {
         // Test paths in OpenCL
@@ -12021,6 +12041,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     for (auto [m, k] : { std::pair<int64_t, int64_t>{17408, 5120}, {5120, 17408}, {16384, 5120}, {6144, 5120}, {5120, 6144} }) {
         for (int64_t n : {1, 2, 3, 4, 5, 6, 7, 8}) {
             test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, m, n, k, {1, 1}, {1, 1}));
+        }
+    }
+    // RAVEN_MM_ADD (bench only): ffn_down and attn-out with the fused residual, as the verify graph runs them
+    for (auto [m, k] : { std::pair<int64_t, int64_t>{5120, 17408}, {5120, 6144} }) {
+        for (int64_t n : {1, 2, 3, 4, 5, 6, 7, 8}) {
+            test_cases.emplace_back(new test_mul_mat_add(GGML_TYPE_Q8_0, m, n, k, MUL_MAT_ADD_RES_INPLACE));
         }
     }
     // RAVEN_FA_PACKED (bench only): the same attention with the 6 grouped heads packed into rows (4 heads x 6*nq rows)

@@ -214,6 +214,7 @@ constant short FC_mul_mv_ne12  [[function_constant(FC_MUL_MV + 2)]];
 constant short FC_mul_mv_r2    [[function_constant(FC_MUL_MV + 3)]];
 constant short FC_mul_mv_r3    [[function_constant(FC_MUL_MV + 4)]];
 constant bool  FC_mul_mv_split [[function_constant(FC_MUL_MV + 5)]];
+constant bool  FC_mul_mv_add   [[function_constant(FC_MUL_MV + 6)]]; // kernel_mul_mv_q8_0_f32_r1: dst = sum + src2
 
 template<typename block_q_type, short NR0, typename args_t>
 void mul_vec_q_n_f32_impl(
@@ -596,6 +597,154 @@ kernel void kernel_mul_mv_q8_0_f32(
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
     kernel_mul_mv_q8_0_f32_impl<N_R0_Q8_0, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
 }
+
+// Q8_0 x F32 for 2..8 src1 rows (speculative verify), one pass over the weights: kernel_mul_mv_q8_0_f32's lane map and 4-way K split,
+// with all R1 = ne11 src1 rows of a lane in registers. A threadgroup is NRG = FC_mul_mv_nsg/4 row groups of NR0 src0 rows, each of
+// 4 K-slice simdgroups; row groups on the same K slice read the same src1 lines in the same step. Each weight is converted once
+// for the R1 rows, each src1 value is loaded once for the NR0 rows. A sum has the terms and order of the n = 1 kernel.
+// Buffers and args are those of kernel_mul_mv_mma_blk, so the MMA encoder dispatches it with the residual of a fused ADD.
+template<short NR0, short R1>
+kernel void kernel_mul_mv_q8_0_f32_r1(
+        constant ggml_metal_kargs_mul_mv_ext & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        device const char * src2,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    constexpr short NK = 4;                // K-slice simdgroups per row group (N_SG_Q8_0 of the n = 1 kernel)
+    constexpr short NQ = 8;                // quants per lane per block
+    constexpr short NL = N_SIMDWIDTH/NQ;   // lanes per block
+
+    const short NRG = FC_mul_mv_nsg/NK;
+    const short rg  = sgitg/NK;
+    const short sk  = sgitg%NK;
+
+    const int nb = args.ne00/QK8_0;
+    const int r0 = (tgpig.x*NRG + rg)*NR0;
+    const int im = tgpig.z;
+
+    const int i12 = im%FC_mul_mv_ne12;
+    const int i13 = im/FC_mul_mv_ne12;
+
+    const uint64_t offset0 = (uint64_t) (i12/FC_mul_mv_r2)*args.nb02 + (uint64_t) (i13/FC_mul_mv_r3)*args.nb03;
+    const uint64_t offset1 = (uint64_t)  i12*args.nb12               + (uint64_t)  i13*args.nb13;
+
+    device const block_q8_0 * ax[NR0];
+    FOR_UNROLL (short row = 0; row < NR0; ++row) {
+        const int r = min(r0 + row, args.ne01 - 1); // a tail row reads the last row; its sums are not written
+        ax[row] = (device const block_q8_0 *) (src0 + offset0 + (uint64_t) r*args.nb01);
+    }
+
+    const short ix  = tiisg/NL;
+    const short il  = tiisg%NL;
+    const int   ib0 = sk*NQ + ix;
+
+    // the lane's 8 values of src1 row 0 at block ib0; rows are ys float4 apart (16-byte strides and base: ggml_metal_op_mul_mat_mv_r1_cfg)
+    device const float4 * y4 = (device const float4 *) (src1 + offset1) + (ib0*QK8_0 + il*NQ)/4;
+    const uint64_t ys = args.nb11/sizeof(float4);
+
+    float sumf[NR0][R1];
+    FOR_UNROLL (short row = 0; row < NR0; ++row) {
+        FOR_UNROLL (short c = 0; c < R1; ++c) {
+            sumf[row][c] = 0.0f;
+        }
+    }
+
+    for (int ib = ib0; ib < nb; ib += NK*NQ) {
+        if (R1 <= NR0) {
+            // hold the src1 values of all rows, stream the weight rows
+            float4 yl[R1][2];
+            FOR_UNROLL (short c = 0; c < R1; ++c) {
+                yl[c][0] = y4[c*ys + 0];
+                yl[c][1] = y4[c*ys + 1];
+            }
+            FOR_UNROLL (short row = 0; row < NR0; ++row) {
+                device const int8_t * qs = ax[row][ib].qs + il*NQ;
+                float q[NQ];
+                FOR_UNROLL (short i = 0; i < NQ; ++i) {
+                    q[i] = qs[i];
+                }
+                const float d = ax[row][ib].d;
+                FOR_UNROLL (short c = 0; c < R1; ++c) {
+                    float sumq = 0.0f;
+                    FOR_UNROLL (short i = 0; i < NQ; ++i) {
+                        sumq += q[i]*yl[c][i/4][i%4];
+                    }
+                    sumf[row][c] += sumq*d;
+                }
+            }
+        } else {
+            // hold the converted weights of all rows, stream the src1 rows
+            float q[NR0][NQ];
+            float d[NR0];
+            FOR_UNROLL (short row = 0; row < NR0; ++row) {
+                device const int8_t * qs = ax[row][ib].qs + il*NQ;
+                FOR_UNROLL (short i = 0; i < NQ; ++i) {
+                    q[row][i] = qs[i];
+                }
+                d[row] = ax[row][ib].d;
+            }
+            FOR_UNROLL (short c = 0; c < R1; ++c) {
+                const float4 y0 = y4[c*ys + 0];
+                const float4 y1 = y4[c*ys + 1];
+                FOR_UNROLL (short row = 0; row < NR0; ++row) {
+                    float sumq = 0.0f;
+                    FOR_UNROLL (short i = 0; i < 4; ++i) {
+                        sumq += q[row][i]*y0[i];
+                    }
+                    FOR_UNROLL (short i = 0; i < 4; ++i) {
+                        sumq += q[row][4 + i]*y1[i];
+                    }
+                    sumf[row][c] += sumq*d[row];
+                }
+            }
+        }
+
+        y4 += NK*NQ*QK8_0/4;
+    }
+
+    // a simd_sum per output, the 4 K-slice partials through threadgroup memory, then a simd_sum of them (as helper_mv_reduce_and_write)
+    threadgroup float * red = (threadgroup float *) shmem + rg*(NR0*R1*NK);
+
+    FOR_UNROLL (short row = 0; row < NR0; ++row) {
+        FOR_UNROLL (short c = 0; c < R1; ++c) {
+            const float s = simd_sum(sumf[row][c]);
+            if (tiisg == 0) {
+                red[(row*R1 + c)*NK + sk] = s;
+            }
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    device       float * dst_f32 = (device       float *) dst  + (uint64_t) im*args.ne0*args.ne1;
+    device const float * res_f32 = (device const float *) src2 + (uint64_t) im*args.ne0*args.ne1;
+
+    for (short k = sk; k < NR0*R1; k += NK) {
+        const float tot = simd_sum(tiisg < NK ? red[k*NK + tiisg] : 0.0f);
+
+        const int r = r0 + k/R1;
+        if (tiisg == 0 && r < args.ne01) {
+            const uint64_t i = (uint64_t) (k%R1)*args.ne0 + r;
+            dst_f32[i] = FC_mul_mv_add ? tot + res_f32[i] : tot; // the same lane reads the residual and writes the sum
+        }
+    }
+}
+
+typedef decltype(kernel_mul_mv_q8_0_f32_r1<4, 2>) mul_mv_q8_0_f32_r1_t;
+
+#define MUL_MV_Q8_0_R1(r1, nr0) \
+template [[host_name("kernel_mul_mv_q8_0_f32_r1_" #r1 "_nr0_" #nr0)]] kernel mul_mv_q8_0_f32_r1_t kernel_mul_mv_q8_0_f32_r1<nr0, r1>;
+
+// keep in sync with ggml_metal_mv_r1_instantiated (ggml-metal-common.cpp)
+MUL_MV_Q8_0_R1(2, 2) MUL_MV_Q8_0_R1(3, 2) MUL_MV_Q8_0_R1(4, 2) MUL_MV_Q8_0_R1(5, 2) MUL_MV_Q8_0_R1(6, 2) MUL_MV_Q8_0_R1(7, 2) MUL_MV_Q8_0_R1(8, 2)
+MUL_MV_Q8_0_R1(2, 4) MUL_MV_Q8_0_R1(3, 4) MUL_MV_Q8_0_R1(4, 4) MUL_MV_Q8_0_R1(5, 4) MUL_MV_Q8_0_R1(6, 4) MUL_MV_Q8_0_R1(7, 4) MUL_MV_Q8_0_R1(8, 4)
+MUL_MV_Q8_0_R1(2, 8) MUL_MV_Q8_0_R1(3, 8)
+
+#undef MUL_MV_Q8_0_R1
 
 // mat-vec kernel processing in chunks of float4
 // chpb - chunks per quantization block

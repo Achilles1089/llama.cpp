@@ -313,6 +313,7 @@ template [[host_name("kernel_mul_mv_mma_q4_0_f32_nt4_rt2")]] kernel mul_mv_mma_t
 template [[host_name("kernel_mul_mv_mma_q8_0_f32_nt1_rt1")]] kernel mul_mv_mma_t kernel_mul_mv_mma_blk<1, 1, mul_mv_mma_q8_0>;
 template [[host_name("kernel_mul_mv_mma_q8_0_f32_nt2_rt1")]] kernel mul_mv_mma_t kernel_mul_mv_mma_blk<2, 1, mul_mv_mma_q8_0>;
 template [[host_name("kernel_mul_mv_mma_q8_0_f32_nt4_rt1")]] kernel mul_mv_mma_t kernel_mul_mv_mma_blk<4, 1, mul_mv_mma_q8_0>;
+template [[host_name("kernel_mul_mv_mma_q8_0_f32_nt8_rt1")]] kernel mul_mv_mma_t kernel_mul_mv_mma_blk<8, 1, mul_mv_mma_q8_0>;
 
 // q5_K scale and min of sub-block j from the 12 packed bytes, held as 3 words
 inline float2 mul_mv_mma_q5_K_scale_min(thread const uint * w, short j) {

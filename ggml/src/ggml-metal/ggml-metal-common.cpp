@@ -1,5 +1,6 @@
 #include "ggml-metal-common.h"
 
+#include <cstdint>
 #include <cstdlib>
 #include "ggml-metal-fusion.h"
 
@@ -165,6 +166,74 @@ bool ggml_metal_op_mul_mat_use_mma(const struct ggml_tensor * op) {
 
 bool ggml_metal_op_mul_mat_may_use_mma(const struct ggml_tensor * op) {
     return ggml_metal_mul_mv_mma_type_supported(op->src[0]->type) && op->src[1]->type == GGML_TYPE_F32;
+}
+
+// (r1, nr0) of the kernel_mul_mv_q8_0_f32_r1 instantiations in kernels/mul_mv.metal
+static bool ggml_metal_mv_r1_instantiated(int r1, int nr0) {
+    switch (nr0) {
+        case 2:
+        case 4:  return r1 >= 2 && r1 <= 8;
+        case 8:  return r1 == 2 || r1 == 3;
+        default: return false;
+    }
+}
+
+static int ggml_metal_env_int(const char * name, int def) {
+    const char * e = getenv(name);
+    return e ? atoi(e) : def;
+}
+
+// called only on the MMA route (use_mma holds), so a fused ADD is already accepted by the fusion check
+ggml_metal_mv_r1_cfg ggml_metal_op_mul_mat_mv_r1_cfg(const ggml_tensor * op, int gpu_family) {
+    // tuning overrides (bench): the most src1 rows on r1 (0 = off), the same for src0 rows <= 6144, src0 rows per row group, row groups
+    static const int env_max     = ggml_metal_env_int("GGML_METAL_MV_R1_MAX",     -1);
+    static const int env_max_mid = ggml_metal_env_int("GGML_METAL_MV_R1_MAX_MID", -1);
+    static const int env_nr0     = ggml_metal_env_int("GGML_METAL_MV_R1_NR0",      0);
+    static const int env_nrg     = ggml_metal_env_int("GGML_METAL_MV_R1_NRG",      0);
+
+    ggml_metal_mv_r1_cfg cfg = { 0, 0, 0 };
+
+    const ggml_tensor * src0 = op->src[0];
+    const ggml_tensor * src1 = op->src[1];
+
+    // float4 src1 loads: use_mma checked the 16-byte row and batch strides, the base must be 16-byte aligned too
+    if (src0->type != GGML_TYPE_Q8_0 || src1->type != GGML_TYPE_F32 || ((uintptr_t) src1->data) % 16 != 0) {
+        return cfg;
+    }
+
+    const int  n   = (int) src1->ne[1];
+    const bool mid = src0->ne[1] <= 6144; // ffn_down and attn-out (5120 rows) and the 6144-row projections
+
+    // family defaults: off until the M1 Ultra sweep fills the Apple7 row (SPEC section 6.3)
+    int max_big = 0, max_mid = 0, nr0_lo = 4, nr0_hi = 2, nrg = 1;
+    if (gpu_family == 7) {
+        // M1 Ultra sweep 2026-10-15 (Qwen3.8-27B Q8_0 shapes): r1 beats MMA only at 2 src1 rows (x1.09-1.37, at 1.06-1.15x the
+        // 1-row time); from 3 rows MMA wins or ties everywhere. 2 row groups for the 16384/17408-row shapes, 1 for the 5120/6144 ones
+        max_big = 2; max_mid = 2; nr0_lo = 4; nr0_hi = 4; nrg = mid ? 1 : 2;
+    }
+
+    int max = mid ? max_mid : max_big;
+    if (env_max >= 0) {
+        max = env_max;
+    }
+    if (mid && env_max_mid >= 0) {
+        max = env_max_mid;
+    }
+
+    const int nr0 = env_nr0 > 0 ? env_nr0 : (n <= 4 ? nr0_lo : nr0_hi);
+    if (env_nrg > 0) {
+        nrg = env_nrg;
+    }
+
+    if (n < 2 || n > max || !ggml_metal_mv_r1_instantiated(n, nr0) || (nrg != 1 && nrg != 2 && nrg != 4)) {
+        return cfg;
+    }
+
+    cfg.r1  = n;
+    cfg.nr0 = nr0;
+    cfg.nrg = nrg;
+
+    return cfg;
 }
 
 // represents a memory range (i.e. an interval from a starting address p0 to an ending address p1 in a given buffer pb)

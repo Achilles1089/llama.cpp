@@ -838,9 +838,22 @@ static size_t ggml_metal_mul_mv_mma_smem(int nsg, int nt, int rt) {
     return (size_t) nsg*nt*rt*tile_bytes;
 }
 
+// tuning overrides of the few-row MMA tiling (bench; unset = the defaults):
+//   GGML_METAL_MMA_MIN_TG  threadgroups that fill the GPU (GGML_METAL_MIN_THREADGROUPS = 128, tuned on an M3 Ultra)
+//   GGML_METAL_MMA_NSG     simdgroups per threadgroup before the halving to the K steps (1..32, a power of 2)
+//   GGML_METAL_MMA_NT_MAX  8-row src0 tiles per threadgroup at most (1, 2, 4; 8 only for q8_0 with one src1 tile)
+static int ggml_metal_mma_env(const char * name, int def) {
+    const char * e = getenv(name);
+    return e ? atoi(e) : def;
+}
+
 // fewer src0 rows need more simdgroups per threadgroup (a finer K split) to fill the GPU.
 // the tiles become narrower when the K-slice reduction buffer is too large or when too few threadgroups fill the GPU.
 static ggml_metal_mma_tiling ggml_metal_op_mul_mat_mma_tiling(const ggml_tensor * op) {
+    static const int64_t min_tg  = ggml_metal_mma_env("GGML_METAL_MMA_MIN_TG", (int) GGML_METAL_MIN_THREADGROUPS);
+    static const int     nsg_env = ggml_metal_mma_env("GGML_METAL_MMA_NSG", 0);
+    static const int     nt_env  = ggml_metal_mma_env("GGML_METAL_MMA_NT_MAX", GGML_METAL_MMA_NT_MAX);
+
     const ggml_type type = op->src[0]->type;
     const int64_t   ne00 = op->src[0]->ne[0];
     const int64_t   ne01 = op->src[0]->ne[1];
@@ -856,11 +869,18 @@ static ggml_metal_mma_tiling ggml_metal_op_mul_mat_mma_tiling(const ggml_tensor 
     } else if (ne01 <= GGML_METAL_MMA_MANY_ROWS) {
         nsg = GGML_METAL_MMA_NSG_MID_ROWS;
     }
+    if (nsg_env > 0) {
+        nsg = nsg_env;
+    }
     res.nsg = ggml_metal_halve_to_limit(nsg, n_steps);
 
+    // nt = 8 exists only as kernel_mul_mv_mma_q8_0_f32_nt8_rt1
+    const bool nt8_ok = type == GGML_TYPE_Q8_0 && res.rt == 1;
+    const int  nt_max = std::min(nt_env, nt8_ok ? 8 : GGML_METAL_MMA_NT_MAX);
+
     const int64_t nt_smem   = GGML_METAL_MMA_SMEM_MAX/(int64_t) ggml_metal_mul_mv_mma_smem(res.nsg, 1, res.rt);
-    const int64_t nt_rows   = ne01/(GGML_METAL_MIN_THREADGROUPS*GGML_METAL_MMA_TILE);
-    res.nt = ggml_metal_halve_to_limit(GGML_METAL_MMA_NT_MAX, std::min(nt_smem, nt_rows));
+    const int64_t nt_rows   = ne01/(min_tg*GGML_METAL_MMA_TILE);
+    res.nt = ggml_metal_halve_to_limit(nt_max, std::min(nt_smem, nt_rows));
 
     return res;
 }
@@ -917,6 +937,55 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_mma(ggml_
 
     res.nr0 = GGML_METAL_MMA_TILE*nt;
     res.nr1 = GGML_METAL_MMA_TILE*rt;
+
+    return res;
+}
+
+// kernel_mul_mv_q8_0_f32_r1 for all ne11 = r1 src1 rows in one pass; fewer row groups when the device cannot run 128*nrg threads
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_q8_0_r1(ggml_metal_library_t lib, const ggml_tensor * op, int r1, int nr0, int nrg, bool add) {
+    GGML_ASSERT(op->src[0]->type == GGML_TYPE_Q8_0 && op->src[1]->ne[1] == r1);
+
+    const int ne12 = op->src[1]->ne[2];
+    const int r2   = ne12 / op->src[0]->ne[2];
+    const int r3   = op->src[1]->ne[3] / op->src[0]->ne[3];
+
+    GGML_ASSERT(ne12 <= INT16_MAX && r2 <= INT16_MAX && r3 <= INT16_MAX);
+
+    char base[256];
+    char name[256];
+
+    snprintf(base, 256, "kernel_mul_mv_q8_0_f32_r1_%d_nr0_%d", r1, nr0);
+
+    ggml_metal_pipeline_with_params res;
+    for (;; nrg /= 2) {
+        const int nsg = 4*nrg;
+
+        snprintf(name, 256, "%s_nsg=%d_ne12=%d_r2=%d_r3=%d_add=%d", base, nsg, ne12, r2, r3, add);
+
+        res = ggml_metal_library_get_pipeline(lib, name);
+        if (!res.pipeline) {
+            ggml_metal_cv_t cv = ggml_metal_cv_init();
+
+            ggml_metal_cv_set_int16(cv, nsg,            FC_MUL_MV + 0);
+            ggml_metal_cv_set_int16(cv, (int16_t) ne12, FC_MUL_MV + 2);
+            ggml_metal_cv_set_int16(cv, (int16_t) r2,   FC_MUL_MV + 3);
+            ggml_metal_cv_set_int16(cv, (int16_t) r3,   FC_MUL_MV + 4);
+            ggml_metal_cv_set_bool (cv, add,            FC_MUL_MV + 6);
+
+            res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
+
+            ggml_metal_cv_free(cv);
+        }
+
+        if (nrg == 1 || ggml_metal_pipeline_max_theads_per_threadgroup(res) >= nsg*32) {
+            break;
+        }
+    }
+
+    res.nsg  = 4*nrg;
+    res.nr0  = nr0*nrg; // src0 rows per threadgroup
+    res.nr1  = r1;      // every src1 row: grid.y = 1
+    res.smem = (size_t) nrg*nr0*r1*4*sizeof(float);
 
     return res;
 }

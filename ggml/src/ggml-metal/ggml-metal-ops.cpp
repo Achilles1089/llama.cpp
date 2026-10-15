@@ -15,6 +15,7 @@
 #include <limits>
 #include <cmath>
 #include <cstdlib>
+#include <atomic>
 
 // threadgroups needed to fill the GPU
 // TODO: dedup
@@ -2481,7 +2482,14 @@ static int ggml_metal_op_mul_mat_mma(ggml_metal_op_t ctx, int idx) {
         res = dst->src[0] == op ? dst->src[1] : dst->src[0];
     }
 
-    auto pipeline = ggml_metal_library_get_pipeline_mul_mv_mma_auto(lib, op, fuse_add);
+    const ggml_metal_device_props * props_dev = ggml_metal_device_get_props(ctx->dev);
+
+    // few src1 rows of Q8_0: the mat-vec with the rows in registers (r1), else the 8x8 MMA kernel; both take the fused residual
+    const ggml_metal_mv_r1_cfg r1cfg = ggml_metal_op_mul_mat_mv_r1_cfg(op, props_dev->gpu_family);
+
+    auto pipeline = r1cfg.r1 > 0
+        ? ggml_metal_library_get_pipeline_mul_mv_q8_0_r1(lib, op, r1cfg.r1, r1cfg.nr0, r1cfg.nrg, fuse_add)
+        : ggml_metal_library_get_pipeline_mul_mv_mma_auto(lib, op, fuse_add);
 
     ggml_metal_kargs_mul_mv_ext args = {
         /*.ne00  =*/ ne00,
@@ -2589,6 +2597,18 @@ static int ggml_metal_op_mul_mat_mv(ggml_metal_op_t ctx, int idx) {
 
 int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * op = ctx->node(idx);
+
+    // GGML_METAL_MM_HIST (diagnostic): src1 rows of the k = 17408 Q8_0 mat-muls (ffn_down: one per layer per step), logged every 4096
+    static const bool mm_hist = getenv("GGML_METAL_MM_HIST") != nullptr;
+    if (mm_hist && op->src[0]->type == GGML_TYPE_Q8_0 && op->src[0]->ne[0] == 17408) {
+        static std::atomic<int64_t> h[10] = {};
+        h[std::min<int64_t>(op->src[1]->ne[1], 9)]++;
+        if (++h[0] % 4096 == 0) { // h[0] counts all calls (no n = 0 mat-mul exists)
+            GGML_LOG_WARN("mm-hist ffn_down n: 1:%lld 2:%lld 3:%lld 4:%lld 5:%lld 6:%lld 7:%lld 8:%lld >8:%lld\n",
+                (long long) h[1], (long long) h[2], (long long) h[3], (long long) h[4], (long long) h[5],
+                (long long) h[6], (long long) h[7], (long long) h[8], (long long) h[9]);
+        }
+    }
 
     ggml_metal_library_t lib = ctx->lib;
     ggml_metal_encoder_t enc = ctx->enc;
