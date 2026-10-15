@@ -4220,6 +4220,21 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MAX"));
     add_opt(common_arg(
+        {"--spec-draft-ctx-caps"}, "N:C,...",
+        "cap the draft length by context: once a slot holds N tokens, draft at most C (e.g. 32768:4,65536:3). On Apple GPUs the\n"
+        "verify's attention grows with every drafted row times the context, so long chats pay more per guess (default: none)",
+        [](common_params & params, const std::string & value) {
+            params.spec_ctx_caps.clear();
+            for (const auto & item : string_split<std::string>(value, ',')) {
+                const auto pos = item.find(':');
+                if (pos == std::string::npos) {
+                    throw std::invalid_argument("expected N:C pairs");
+                }
+                params.spec_ctx_caps.emplace_back(std::stoi(item.substr(0, pos)), std::stoi(item.substr(pos + 1)));
+            }
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--spec-draft-n-min"}, "N",
         string_format("minimum number of draft tokens to use for speculative decoding (default: %d)", params.speculative.draft.n_min),
         [](common_params & params, int value) {

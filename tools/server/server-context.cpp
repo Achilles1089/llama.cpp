@@ -257,6 +257,9 @@ struct server_slot {
     mtmd_context * mctx = nullptr;
     mtmd::batch_ptr mbatch = nullptr;
 
+    // --spec-draft-ctx-caps: past N tokens of context, draft at most C
+    std::vector<std::pair<int32_t, int32_t>> spec_ctx_caps;
+
     // speculative decoding
     common_speculative * spec;
 
@@ -538,6 +541,13 @@ struct server_slot {
 
         if (n_remaining() > 0) {
             n_draft_max = std::min(n_draft_max, n_remaining() - 1);
+        }
+
+        // a long context makes each drafted row dearer to verify (the attention reads the whole context once per row)
+        for (const auto & [n_from, cap] : spec_ctx_caps) {
+            if ((int32_t) prompt.n_tokens() >= n_from) {
+                n_draft_max = std::min(n_draft_max, (int) cap);
+            }
         }
 
         SLT_DBG(*this, "max possible draft: %d\n", n_draft_max);
@@ -1474,6 +1484,7 @@ private:
             slot.mem.init(ctx_tgt, ctx_dft);
             slot.spec    = spec.get();
             slot.n_ctx   = n_ctx_slot();
+            slot.spec_ctx_caps = params_base.spec_ctx_caps;
 
             slot.mctx                   = mctx;
             slot.prompt.tokens.has_mtmd = mctx != nullptr;
