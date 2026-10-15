@@ -2047,11 +2047,11 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_v
     return res;
 }
 
-ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_gqa(ggml_metal_library_t lib, const ggml_tensor * op, bool has_mask, int32_t nsg, int32_t nwg, int32_t ns10, int32_t ns20) {
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_gqa(ggml_metal_library_t lib, const ggml_tensor * op, bool has_mask, int32_t nq, int32_t nsg, int32_t nwg, int32_t ns10, int32_t ns20) {
     char base[256];
     char name[256];
 
-    snprintf(base, 256, "kernel_flash_attn_ext_gqa_f16_dk%d_dv%d", (int) op->src[1]->ne[0], (int) op->src[2]->ne[0]);
+    snprintf(base, 256, "kernel_flash_attn_ext_gqa_f16_dk%d_dv%d_q%d", (int) op->src[1]->ne[0], (int) op->src[2]->ne[0], nq);
     snprintf(name, 256, "%s_mask=%d_ns10=%d_ns20=%d_nwg=%d", base, has_mask, ns10, ns20, nwg);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);

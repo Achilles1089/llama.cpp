@@ -4052,18 +4052,21 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
         // GQA FLASH-DECODING (kernels/fa_gqa.metal, 2026-10-15): the vec kernel's cost is per (query row x head x key) -
         // M1 Ultra, Qwen3.8-27B (24 heads on 4 KV heads, head 256) at 45k context: a 7-row speculative verify cost 5.4x a
         // decode - and the half8x8 kernel has no key split, so a decode launches only a few threadgroups.
-        // kernel_flash_attn_ext_gqa runs the half8x8 math on rows packed by KV group (every head that shares a KV head,
-        // at every query position) with the same key split as the vec kernel; the vec reduce combines the splits.
-        // GGML_METAL_FA_GQA_MIN_KV: the shortest context it takes (default 2048; <= 0 turns it off).
+        // kernel_flash_attn_ext_gqa does the half8x8 math on rows packed by KV group (every head that shares a KV head,
+        // at every query position), 8/16/24 rows per threadgroup, with the vec kernel's key split; the vec reduce
+        // combines the splits. GGML_METAL_FA_GQA_MIN_KV: the shortest context it takes (default 2048; <= 0 turns it off).
         {
             static const int gqa_min_kv = [] {
                 const char * e = getenv("GGML_METAL_FA_GQA_MIN_KV");
                 return e ? atoi(e) : 2048;
             }();
 
-            constexpr int64_t GQA_Q   = 8;   // packed rows per threadgroup (kernel template)
-            constexpr int64_t GQA_C   = 64;  // keys per block (kernel template)
-            constexpr int32_t GQA_NSG = 4;   // simdgroups per threadgroup (kernel template)
+            static const int gqa_q_force = [] {
+                const char * e = getenv("GGML_METAL_FA_GQA_Q");   // 8, 16 or 24 forces the rows per threadgroup (tuning)
+                return e ? atoi(e) : 0;
+            }();
+
+            constexpr int64_t GQA_C = 64;  // keys per block (kernel template)
 
             const int64_t gqa_g = ne12 > 0 ? ne02/ne12 : 0;
 
@@ -4080,12 +4083,33 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
                 const int32_t ns10_gqa = nb11_attn/nb10_attn;
                 const int32_t ns20_gqa = nb21_attn/nb20_attn;
 
-                auto pipeline_gqa = ggml_metal_library_get_pipeline_flash_attn_ext_gqa(lib, op, has_mask, GQA_NSG, nwg, ns10_gqa, ns20_gqa);
+                // rows per threadgroup: every K/V tile loaded serves the whole row tile, so fewer tiles = fewer reads of the
+                // KV head, but a 24-row tile costs ~1.8x a 16- or 8-row one (M1 Ultra, head 256, 45k context: 8 rows
+                // ~0.32 ms, 16 rows ~0.36 ms, 24 rows ~0.64 ms per tile) - the least tiles x relative cost, the smaller
+                // tile on a tie
+                const int64_t nr = gqa_g*ne01;
 
-                GGML_ASSERT(GQA_NSG*32 <= ggml_metal_pipeline_max_theads_per_threadgroup(pipeline_gqa));
+                int32_t gqa_q    = 8;
+                int64_t gqa_cost = 10*((nr + 7)/8);
+                for (auto [cand, w] : { std::pair<int32_t, int64_t>{16, 11}, std::pair<int32_t, int64_t>{24, 18} }) {
+                    const int64_t cost = w*((nr + cand - 1)/cand);
+                    if (cost < gqa_cost) {
+                        gqa_q    = cand;
+                        gqa_cost = cost;
+                    }
+                }
+                if (gqa_q_force == 8 || gqa_q_force == 16 || gqa_q_force == 24) {
+                    gqa_q = gqa_q_force;
+                }
+                const int32_t gqa_nsg = gqa_q == 8 ? 4 : 8;
 
-                // the half8x8 kernel's shared memory: Q*(DK + 2*PAD(DV, 64) + 4*C) halfs
-                const size_t smem_gqa = GGML_PAD((size_t) GQA_Q*(ne00 + 2*GGML_PAD(ne20, 64) + 4*GQA_C)*sizeof(ggml_fp16_t), 16);
+                auto pipeline_gqa = ggml_metal_library_get_pipeline_flash_attn_ext_gqa(lib, op, has_mask, gqa_q, gqa_nsg, nwg, ns10_gqa, ns20_gqa);
+
+                GGML_ASSERT(gqa_nsg*32 <= ggml_metal_pipeline_max_theads_per_threadgroup(pipeline_gqa));
+
+                // kernels/fa_gqa.metal: max(Q*(DK + 3*C), Q*DV) halfs, then Q/8 diagonal 8x8 float matrices
+                const size_t smem_a   = std::max<size_t>(gqa_q*(ne00 + 3*GQA_C), gqa_q*ne20)*sizeof(ggml_fp16_t);
+                const size_t smem_gqa = GGML_PAD(smem_a + (gqa_q/8)*64*sizeof(float), 16);
                 GGML_ASSERT(smem_gqa <= props_dev->max_theadgroup_memory_size);
 
                 assert(ggml_metal_op_flash_attn_ext_extra_tmp(op) != 0);
@@ -4135,7 +4159,7 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
                 ggml_metal_encoder_set_buffer  (enc, bid_tmp,  5);
 
                 ggml_metal_encoder_set_threadgroup_memory_size(enc, smem_gqa, 0);
-                ggml_metal_encoder_dispatch_threadgroups(enc, (gqa_g*ne01 + GQA_Q - 1)/GQA_Q, ne12, ne03*nwg, 32, GQA_NSG, 1);
+                ggml_metal_encoder_dispatch_threadgroups(enc, (nr + gqa_q - 1)/gqa_q, ne12, ne03*nwg, 32, gqa_nsg, 1);
 
                 ggml_metal_op_concurrency_reset(ctx);
 
