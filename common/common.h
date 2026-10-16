@@ -589,6 +589,7 @@ struct common_params {
     bool no_extra_bufts    = false; // disable extra buffer types (used for weight repacking)
     bool no_host           = false; // bypass host buffer allowing extra buffers to be used
     bool load_mtp          = false; // load MTP/NextN layers
+    bool mtp_head_q4_0     = false; // --spec-draft-head-q4: a Q4_0 copy of the output head for the MTP draft head
 
     bool single_turn       = false; // single turn chat conversation
 

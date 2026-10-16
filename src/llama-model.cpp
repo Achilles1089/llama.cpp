@@ -26,6 +26,7 @@
 #include "ggml-cpp.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <cfloat>
 #include <cstdint>
@@ -38,6 +39,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params & params) {
@@ -2020,8 +2022,103 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
 
     load_tensors_hadamard();
+    load_tensors_mtp_head_q4();
 
     return true;
+}
+
+// --spec-draft-head-q4 (Raven, 2026-10-15): the MTP draft head computes logits over the whole vocab with the output head,
+// ~75% of a draft step's weight bytes (Qwen3.8-27B Q8_0: 1.35 of 1.80 GB). A Q4_0 copy for the draft head alone halves them.
+// The target keeps its head, so the verified distribution is unchanged (rejection sampling uses the draft's own q); only the
+// acceptance rate moves. It is built here, not stored in the GGUF, so the file - and the server's saved-state manifest, which
+// records its path, size and mtime - stays the same: saved chats stay valid (their KV does not depend on the head).
+void llama_model_base::load_tensors_mtp_head_q4() {
+    if (!params.mtp_head_q4_0 || output == nullptr || output->buffer == nullptr || output->type == GGML_TYPE_Q4_0) {
+        return;
+    }
+
+    const ggml_type_traits * traits = ggml_get_type_traits(output->type);
+    if (traits->to_float == nullptr || output->ne[0] % ggml_blck_size(GGML_TYPE_Q4_0) != 0 || !ggml_is_contiguous(output)) {
+        LLAMA_LOG_WARN("%s: --spec-draft-head-q4: the output head (%s) cannot be requantized - the draft head keeps it\n",
+            __func__, ggml_type_name(output->type));
+        return;
+    }
+
+    ggml_tensor * head = nullptr;
+
+    for (size_t il = 0; il < layers.size(); ++il) {
+        auto & nextn = layers[il].nextn;
+        if (nextn.eh_proj == nullptr || nextn.shared_head_head != nullptr) {
+            continue;
+        }
+
+        if (head == nullptr) {
+            const int64_t t_start_us = ggml_time_us();
+
+            const int64_t ne0  = output->ne[0];
+            const int64_t ne1  = output->ne[1];
+            const size_t  nb_s = ggml_row_size(output->type,   ne0);
+            const size_t  nb_d = ggml_row_size(GGML_TYPE_Q4_0, ne0);
+
+            ggml_init_params ip = {
+                /*.mem_size   =*/ ggml_tensor_overhead(),
+                /*.mem_buffer =*/ NULL,
+                /*.no_alloc   =*/ true,
+            };
+            ggml_context_ptr ctx { ggml_init(ip) };
+            if (!ctx) {
+                throw std::runtime_error("--spec-draft-head-q4: failed to create the context");
+            }
+
+            head = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_Q4_0, ne0, ne1);
+            ggml_set_name(head, "mtp.output.q4_0");
+
+            ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(output->buffer);
+            ggml_backend_buffer_ptr buffer { ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft) };
+            if (!buffer) {
+                throw std::runtime_error(format("--spec-draft-head-q4: unable to allocate a %s buffer", ggml_backend_buft_name(buft)));
+            }
+            ggml_backend_buffer_set_usage(buffer.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+            // requantize on the CPU in row chunks, in parallel, then one upload
+            std::vector<uint8_t> src((size_t) ne1*nb_s);
+            ggml_backend_tensor_get(output, src.data(), 0, src.size());
+
+            std::vector<uint8_t> dst((size_t) ne1*nb_d);
+
+            const int     n_threads = std::max(1, std::min(16, (int) std::thread::hardware_concurrency()));
+            const int64_t chunk     = 256;
+
+            std::atomic<int64_t> next { 0 };
+            std::vector<std::thread> workers;
+            for (int t = 0; t < n_threads; ++t) {
+                workers.emplace_back([&]() {
+                    std::vector<float> f((size_t) chunk*ne0);
+                    for (int64_t r0; (r0 = next.fetch_add(chunk)) < ne1; ) {
+                        const int64_t nr = std::min(chunk, ne1 - r0);
+                        traits->to_float(src.data() + (size_t) r0*nb_s, f.data(), nr*ne0);
+                        ggml_quantize_chunk(GGML_TYPE_Q4_0, f.data(), dst.data() + (size_t) r0*nb_d, 0, nr, ne0, nullptr);
+                    }
+                });
+            }
+            for (auto & w : workers) {
+                w.join();
+            }
+
+            ggml_backend_tensor_set(head, dst.data(), 0, dst.size());
+
+            std::vector<ggml_backend_buffer_ptr> buffers;
+            buffers.emplace_back(std::move(buffer));
+            pimpl->ctxs_bufs.emplace_back(std::move(ctx), std::move(buffers));
+
+            LLAMA_LOG_INFO("%s: --spec-draft-head-q4: the MTP draft head reads a Q4_0 copy of the output head (%s %.1f MiB -> %.1f MiB, %s, %.1f s)\n",
+                __func__, ggml_type_name(output->type), src.size()/1024.0/1024.0, dst.size()/1024.0/1024.0, ggml_backend_buft_name(buft),
+                (ggml_time_us() - t_start_us)/1e6);
+        }
+
+        nextn.shared_head_head   = head;
+        nextn.shared_head_head_s = nullptr;
+    }
 }
 
 // read and check the prism.hadamard metadata, and record the folded weights (load_tensors_hadamard makes the tensors)
@@ -3346,6 +3443,7 @@ llama_model_params llama_model_default_params() {
         /*.no_host                     =*/ false,
         /*.no_alloc                    =*/ false,
         /*.load_mtp                    =*/ false,
+        /*.mtp_head_q4_0               =*/ false,
     };
 
     return result;

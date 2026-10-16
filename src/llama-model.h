@@ -906,6 +906,9 @@ struct llama_model_base : public llama_model {
     // helper: make the prism.hadamard rotation and sign tensors for the folded weights
     void load_tensors_hadamard();
 
+    // helper: --spec-draft-head-q4 - a Q4_0 copy of the output head for MTP layers without a head of their own
+    void load_tensors_mtp_head_q4();
+
     // helper: read the SWA pattern as one flag per layer, or as a period expanded by set_swa_pattern
     void load_swa_pattern(llama_model_loader & ml, uint32_t n_pattern, bool dense_first = false);
 
