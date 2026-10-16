@@ -259,6 +259,11 @@ struct common_params_sampling {
 
     uint64_t user_sampling_config = 0; // bitfield to track user-specified samplers
 
+    // speculative verify, inside a reasoning block only (between the reasoning-budget start and end sequences): keep a
+    // drafted token the target rates at least spec_relax_think x its top token's probability, instead of the exact
+    // min(1, p/q) test. 0 = off (exact, the default). Lossy by design; the answer and tool calls stay exact.
+    float spec_relax_think = 0.0f;
+
     std::vector<std::string> dry_sequence_breakers = {"\n", ":", "\"", "*"};     // default sequence breakers for DRY
 
     std::vector<enum common_sampler_type> samplers = {

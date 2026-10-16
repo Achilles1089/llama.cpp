@@ -11,7 +11,10 @@
 #include <cctype>
 #include <climits>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <random>
 #include <unordered_map>
 #include <vector>
@@ -730,9 +733,91 @@ static float prob_of(const llama_token_data * data, size_t n, llama_token id) {
     return 0.0f;
 }
 
+// Relaxed acceptance guard: true if the last SPEC_RELAX_RUN - 1 tokens plus `next` already occur in the recent history -
+// the step would extend a repeat, so the exact test decides (relaxing must never be what keeps a loop going).
+static constexpr size_t SPEC_RELAX_RUN = 12;
+
+static bool spec_extends_repeat(const ring_buffer<llama_token> & prev, llama_token next) {
+    const size_t n = prev.size();
+    if (n < 2*SPEC_RELAX_RUN) {
+        return false;
+    }
+    // key: prev.rat(SPEC_RELAX_RUN - 2) .. prev.rat(0), next  (oldest first)
+    for (size_t start = SPEC_RELAX_RUN - 1; start + SPEC_RELAX_RUN <= n; ++start) {
+        // candidate occurrence ending at rat(start - (SPEC_RELAX_RUN - 1)) ... compare token by token
+        bool same = prev.rat(start - (SPEC_RELAX_RUN - 1)) == next;
+        for (size_t k = 1; same && k < SPEC_RELAX_RUN; ++k) {
+            same = prev.rat(start - (SPEC_RELAX_RUN - 1) + k) == prev.rat(k - 1);
+        }
+        if (same) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// LLAMA_SPEC_PLOG=<file>: one line per drafted position of every probabilistic verify, for sizing the relaxed rule
+// offline: step, position, in-reasoning, p(target of the draft), p(target top), q(draft), outcome
+// (1 exact accept, 0 exact reject, R relaxed accept, -1 not reached - p from the raw logits with temp/top-k/top-p/min-p)
+static FILE * spec_plog() {
+    static FILE * f = [] {
+        const char * path = getenv("LLAMA_SPEC_PLOG");
+        return path && *path ? fopen(path, "a") : nullptr;
+    }();
+    return f;
+}
+
+static std::mutex spec_plog_mtx;
+
+static void spec_plog_raw(const common_params_sampling & sp, const float * logits, int32_t n_vocab, llama_token x, float & p_x, float & p_max) {
+    p_x = p_max = 0.0f;
+    if (!logits || n_vocab <= 0) {
+        return;
+    }
+    const float t = sp.temp > 0.0f ? sp.temp : 1.0f;
+    const int32_t k = sp.top_k > 0 ? std::min(sp.top_k, n_vocab) : n_vocab;
+    std::vector<std::pair<float, llama_token>> v(n_vocab);
+    for (int32_t i = 0; i < n_vocab; ++i) {
+        v[i] = { logits[i]/t, i };
+    }
+    std::partial_sort(v.begin(), v.begin() + k, v.end(), [](const auto & a, const auto & b) { return a.first > b.first; });
+    v.resize(k);
+    float sum = 0.0f;
+    std::vector<float> pr(k);
+    for (int32_t i = 0; i < k; ++i) {
+        pr[i] = expf(v[i].first - v[0].first);
+        sum += pr[i];
+    }
+    int32_t keep = k;
+    float cum = 0.0f;
+    for (int32_t i = 0; i < k; ++i) {
+        pr[i] /= sum;
+        cum += pr[i];
+        if (cum >= sp.top_p && i + 1 < keep) {
+            keep = i + 1;
+        }
+    }
+    while (keep > 1 && pr[keep - 1] < sp.min_p*pr[0]) {
+        --keep;
+    }
+    float s2 = 0.0f;
+    for (int32_t i = 0; i < keep; ++i) {
+        s2 += pr[i];
+    }
+    p_max = pr[0]/s2;
+    for (int32_t i = 0; i < keep; ++i) {
+        if (v[i].second == x) {
+            p_x = pr[i]/s2;
+            break;
+        }
+    }
+}
+
 // Accept a drafted token with probability min(1, p/q), else draw from norm(max(0, p - q)).
 // Preserves the target distribution exactly, and accepts more often than matching does when the
 // draft samples instead of taking its argmax.
+// With params.spec_relax_think = rho > 0, inside a reasoning block only, a drafted token the target rates >= rho x its top
+// token is kept without the test (unless it would extend a repeat) - lossy by design; outside the block nothing changes.
 std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, const std::vector<std::vector<llama_token_data>> & draft_q, bool grammar_first) {
     GGML_ASSERT(idxs.size()    == draft.size() + 1 && "idxs.size() must be draft.size() + 1");
     GGML_ASSERT(draft_q.size() == draft.size() && "draft_q must have one entry per draft token");
@@ -747,8 +832,17 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct com
 
     std::vector<llama_token_data> cand; // candidate array masked by the grammar, if there is one
 
+    const float rho  = gsmpl->params.spec_relax_think;
+    FILE *      plog = spec_plog();
+
+    static uint64_t plog_step = 0;
+    const uint64_t  step      = plog ? ++plog_step : 0;
+
     size_t i = 0;
     for (; i < draft.size(); i++) {
+        // inside the reasoning block: the budget sampler is counting (its state follows the accepted tokens)
+        const bool in_think = gsmpl->rbudget && common_reasoning_budget_get_state(gsmpl->rbudget) == REASONING_BUDGET_COUNTING;
+
         // leaves the target distribution in the candidate array
         const llama_token id_tgt = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
 
@@ -792,10 +886,49 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct com
             }
         }
 
-        if (q_x > 0.0f && (p_x >= q_x || uni(gsmpl->rng) < p_x / q_x)) {
+        float p_max = 0.0f;
+        if (rho > 0.0f || plog) {
+            for (size_t k = 0; k < cur_p->size; ++k) {
+                p_max = std::max(p_max, p_of(k));
+            }
+        }
+
+        // relaxed: the target rates the drafted token among its top options - keep it without the test (no draw)
+        if (rho > 0.0f && in_think && !masked && p_x > 0.0f && p_x >= rho*p_max && !spec_extends_repeat(gsmpl->prev, draft[i])) {
+            if (plog) {
+                std::lock_guard<std::mutex> lock(spec_plog_mtx);
+                fprintf(plog, "%llu,%zu,%d,%.5f,%.5f,%.5f,R\n", (unsigned long long) step, i, (int) in_think, p_x, p_max, q_x);
+            }
             common_sampler_accept(gsmpl, draft[i], true);
             result.push_back(draft[i]);
             continue;
+        }
+
+        const bool acc = q_x > 0.0f && (p_x >= q_x || uni(gsmpl->rng) < p_x / q_x);
+
+        if (plog) {
+            std::lock_guard<std::mutex> lock(spec_plog_mtx);
+            fprintf(plog, "%llu,%zu,%d,%.5f,%.5f,%.5f,%d\n", (unsigned long long) step, i, (int) in_think, p_x, p_max, q_x, (int) acc);
+        }
+
+        if (acc) {
+            common_sampler_accept(gsmpl, draft[i], true);
+            result.push_back(draft[i]);
+            continue;
+        }
+
+        // the positions this step never reached, for the offline sizing (the target already scored them: every drafted
+        // row is in the verify batch, conditioned on the drafted prefix)
+        if (plog) {
+            const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)));
+            std::lock_guard<std::mutex> lock(spec_plog_mtx);
+            for (size_t j = i + 1; j < draft.size(); ++j) {
+                float pj = 0.0f, pmj = 0.0f;
+                spec_plog_raw(gsmpl->params, llama_get_logits_ith(ctx, idxs[j]), n_vocab, draft[j], pj, pmj);
+                fprintf(plog, "%llu,%zu,%d,%.5f,%.5f,%.5f,-1\n", (unsigned long long) step, j, (int) in_think, pj, pmj,
+                        prob_of(draft_q[j].data(), draft_q[j].size(), draft[j]));
+            }
+            fflush(plog);
         }
 
         // rejected: tokens outside q's support keep all of p
