@@ -8517,6 +8517,49 @@ struct test_flash_attn_ext_large_logits : public test_flash_attn_ext {
     }
 };
 
+// split KV streams (kv_unified = false) of different lengths: n_kv is the longest stream's and every key past a stream's
+// end is masked out (-INF), in whole blocks. The last stream uses all kv keys, stream s < ns-1 about kv*(s+1)/(4*ns)
+// (not block aligned); a single stream ends 200 keys short of kv (the KV padding's dead tail)
+struct test_flash_attn_ext_ragged : public test_flash_attn_ext {
+    using test_flash_attn_ext::test_flash_attn_ext;
+
+    std::string vars() override {
+        return test_flash_attn_ext::vars() + ",ragged=1";
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_flash_attn_ext::initialize_tensors(ctx);
+
+        ggml_tensor * m = ggml_get_tensor(ctx, "m");
+        GGML_ASSERT(m != nullptr && m->type == GGML_TYPE_F16 && ggml_is_contiguous(m));
+
+        const int64_t ne0 = m->ne[0];
+        const int64_t ne1 = m->ne[1];
+        const int64_t ne2 = m->ne[2];
+        const int64_t ne3 = m->ne[3];
+
+        std::vector<ggml_fp16_t> data(ggml_nelements(m));
+        ggml_backend_tensor_get(m, data.data(), 0, ggml_nbytes(m));
+
+        const ggml_fp16_t ninf = ggml_fp32_to_fp16(-INFINITY);
+
+        for (int64_t i3 = 0; i3 < ne3; ++i3) {
+            const int64_t len = ne3 == 1      ? std::max<int64_t>(1, ne0 - 200) :
+                                i3 == ne3 - 1 ? ne0 : 1 + (ne0 - 1)*(i3 + 1)/(4*ne3);
+            for (int64_t i2 = 0; i2 < ne2; ++i2) {
+                for (int64_t i1 = 0; i1 < ne1; ++i1) {
+                    ggml_fp16_t * row = data.data() + ((i3*ne2 + i2)*ne1 + i1)*ne0;
+                    for (int64_t i0 = len; i0 < ne0; ++i0) {
+                        row[i0] = ninf;
+                    }
+                }
+            }
+        }
+
+        ggml_backend_tensor_set(m, data.data(), 0, ggml_nbytes(m));
+    }
+};
+
 // GGML_OP_CROSS_ENTROPY_LOSS
 struct test_cross_entropy_loss : public test_case {
     const ggml_type type;
@@ -11719,6 +11762,33 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1},  1025,  64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1}, 16384,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
 
+    // GQA flash-decoding (kernels/fa_gqa.metal) paths the cases above do not reach: more than one block per split, the
+    // 24-row tile, G = 8 on split KV streams (the headless swarm) and whole masked blocks. On Metal run them with
+    // GGML_METAL_FA_GQA_MIN_KV=1, then again with GGML_METAL_FA_GQA_Q=8, 16 and 24 forced in turn
+    for (bool ragged : {false, true}) {
+        const auto add = [&](int64_t hs, int64_t nh, std::array<int64_t, 2> nr23, int64_t kv, int64_t nb) {
+            if (ragged) {
+                test_cases.emplace_back(new test_flash_attn_ext_ragged(hs, hs, nh, nr23, kv, nb, true, false, 0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+            } else {
+                test_cases.emplace_back(new test_flash_attn_ext       (hs, hs, nh, nr23, kv, nb, true, false, 0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+            }
+        };
+        for (int64_t kv : {4096, 8192}) {
+            for (int64_t nb : {1, 3, 4, 7}) {
+                add(256, 4, {6, 1}, kv, nb);    // the Studio lead: 24 q heads on 4 KV heads
+            }
+        }
+        for (int64_t ns : {1, 2, 4, 16}) {
+            for (int64_t nb : {1, 3}) {
+                add(256, 2, {8, ns}, 8192, nb); // the headless swarm: 16 q heads on 2 KV heads, ns streams
+            }
+        }
+        add(256, 2, {8, 16}, 2048, 1);          // the swarm at the default threshold
+        for (int64_t nb : {1, 3, 5}) {
+            add(128, 4, {4, 1}, 8192, nb);
+        }
+    }
+
     // MLA shape: the V cache is a sub-view of the K cache, with quantized KV
     test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {8, 1},  113,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, true));
     test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {8, 1}, 1024,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, true));
@@ -12033,6 +12103,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     for (int64_t kv : {2048, 22528, 45056}) {
         for (int64_t nb : {1, 3, 5, 7}) {
             test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+        }
+    }
+    // SWARM_FA (bench only): Qwen3.6-35B-A3B attention on the headless swarm - head 256, 2 KV heads x 8, decode on 1/4/16
+    // split streams, all at kv and ragged (one stream at kv, the rest short: the block skip's case)
+    for (int64_t kv : {1024, 2048, 4096, 8192, 16384, 32768}) {
+        for (int64_t ns : {1, 4, 16}) {
+            test_cases.emplace_back(new test_flash_attn_ext       (256, 256, 2, {8, ns}, kv, 1, true, false, 0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+            test_cases.emplace_back(new test_flash_attn_ext_ragged(256, 256, 2, {8, ns}, kv, 1, true, false, 0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
         }
     }
 

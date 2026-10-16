@@ -23,6 +23,7 @@ constant bool    FC_fa_gqa_has_mask [[function_constant(FC_FLASH_ATTN_EXT_GQA + 
 constant int32_t FC_fa_gqa_ns10     [[function_constant(FC_FLASH_ATTN_EXT_GQA + 1)]];
 constant int32_t FC_fa_gqa_ns20     [[function_constant(FC_FLASH_ATTN_EXT_GQA + 2)]];
 constant int32_t FC_fa_gqa_nwg      [[function_constant(FC_FLASH_ATTN_EXT_GQA + 3)]];
+constant bool    FC_fa_gqa_skip     [[function_constant(FC_FLASH_ATTN_EXT_GQA + 4)]]; // scan for fully masked blocks (several streams)
 
 template<short DK, short DV, short Q, short C, short NSG>
 kernel void kernel_flash_attn_ext_gqa(
@@ -141,6 +142,30 @@ kernel void kernel_flash_attn_ext_gqa(
         const int ic = ic0*C;
         if (ic >= args.ne11) {
             break;
+        }
+
+        // skip a block that every row of this tile masks out (-INF), as the vec kernel does per 32-key block. With
+        // split KV streams (kv_unified = false) n_kv is the longest stream's, so a shorter stream's cells past its end
+        // are all -INF; without the skip every stream reads K/V out to the longest one's length (and multiplies P = 0
+        // by dead cells' V). Every simdgroup scans the same mask rows - the positions of the tile's valid rows - so the
+        // decision is uniform across the threadgroup and needs no barrier. Only with several streams (FC_fa_gqa_skip):
+        // one stream masks whole blocks only in its KV padding, and the scan costs it 2-4% (M1 Ultra, 45k, 5-7 rows).
+        if (FC_fa_gqa_has_mask && FC_fa_gqa_skip) {
+            const int qp0 = iq1/G;
+            const int qp1 = (min(iq1 + (int) Q, NR) - 1)/G;
+
+            bool any_finite = false;
+            for (int qp = qp0; qp <= qp1; ++qp) {
+                const half2 m2 = ((device const half2 *) (mask + qp*args.nb31 + (iq3%args.ne33)*args.nb33) + ic/2)[tiisg];
+                if (simd_max(max(m2[0], m2[1])) > -MAXHALF) {
+                    any_finite = true;
+                    break;
+                }
+            }
+
+            if (!any_finite) {
+                continue;
+            }
         }
 
         if (FC_fa_gqa_has_mask) {

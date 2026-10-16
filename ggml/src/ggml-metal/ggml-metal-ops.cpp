@@ -4077,7 +4077,7 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
                 ne11 >= gqa_min_kv && ne11 % GQA_C == 0 &&
                 (!has_mask || (op->src[3]->type == GGML_TYPE_F16 && ne32 <= 1 && ne31 >= ne01)) &&
                 nb10 == sizeof(ggml_fp16_t) && nb20 == sizeof(ggml_fp16_t) &&
-                nwg > 1 && nwg <= 32;
+                nwg == 32; // kernel_flash_attn_ext_vec_reduce indexes its 32 lanes as the splits
 
             if (use_gqa) {
                 const int32_t ns10_gqa = nb11_attn/nb10_attn;
@@ -4103,7 +4103,10 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
                 }
                 const int32_t gqa_nsg = gqa_q == 8 ? 4 : 8;
 
-                auto pipeline_gqa = ggml_metal_library_get_pipeline_flash_attn_ext_gqa(lib, op, has_mask, gqa_q, gqa_nsg, nwg, ns10_gqa, ns20_gqa);
+                // the fully-masked-block scan pays only with several KV streams (one stream masks whole blocks only in its padding)
+                const bool gqa_skip = has_mask && ne03 > 1;
+
+                auto pipeline_gqa = ggml_metal_library_get_pipeline_flash_attn_ext_gqa(lib, op, has_mask, gqa_skip, gqa_q, gqa_nsg, nwg, ns10_gqa, ns20_gqa);
 
                 GGML_ASSERT(gqa_nsg*32 <= ggml_metal_pipeline_max_theads_per_threadgroup(pipeline_gqa));
 
@@ -4114,6 +4117,7 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
 
                 assert(ggml_metal_op_flash_attn_ext_extra_tmp(op) != 0);
                 GGML_ASSERT(ne01*ne02*ne03 == ne1*ne2*ne3);
+                GGML_ASSERT((uint64_t) ne1*ne2*ne3 <= (1u << 31));
 
                 ggml_metal_kargs_flash_attn_ext args_gqa = {
                     /*.ne01          =*/ ne01,
