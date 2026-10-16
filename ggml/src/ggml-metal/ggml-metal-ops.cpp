@@ -3092,6 +3092,50 @@ int ggml_metal_op_add_id(ggml_metal_op_t ctx, int idx) {
     return 1;
 }
 
+// prompt batches (>= 20 rows) through the GQA kernel with one split (no reduce): 0 = no, else the rows per threadgroup.
+// The stock half8x8 kernel loads every K/V tile once per head; packed by KV group, one load serves the group's heads.
+// M1 Ultra, Qwen3.8-27B (head 256, 24 heads on 4 KV heads), one layer's attention:
+//   256 rows: 4k 3.57 -> 3.13 ms, 22.5k 19.28 -> 17.42, 45k 38.67 -> 34.84 (16-row tiles; 8 rows slower, 24 rows ~stock)
+//    64 rows: 4k 0.847 -> 0.823, 22.5k 4.69 -> 4.63, 45k 9.38 -> 9.22 (24-row tiles; 16 rows +4%)
+// GGML_METAL_FA_GQA_PREFILL: unset = 16-row tiles from 128 rows, 24-row below; 0 = off; 8/16/24 = forced (tuning).
+// It shares the decode path's context floor (GGML_METAL_FA_GQA_MIN_KV, default 2048).
+int32_t ggml_metal_op_flash_attn_ext_gqa_prefill(const ggml_tensor * op) {
+    static const int32_t q_env = [] {
+        const char * e = getenv("GGML_METAL_FA_GQA_PREFILL");
+        return e ? atoi(e) : -1;
+    }();
+
+    static const int min_kv = [] {
+        const char * e = getenv("GGML_METAL_FA_GQA_MIN_KV");
+        return e ? atoi(e) : 2048;
+    }();
+
+    if (q_env == 0 || min_kv <= 0 || op->src[1]->ne[1] < min_kv) {
+        return 0;
+    }
+
+    const int32_t q = (q_env == 8 || q_env == 16 || q_env == 24) ? q_env : (op->src[0]->ne[1] >= 128 ? 16 : 24);
+
+    const ggml_tensor * q0 = op->src[0];
+    const ggml_tensor * k  = op->src[1];
+    const ggml_tensor * v  = op->src[2];
+    const ggml_tensor * m  = op->src[3];
+
+    float max_bias = 0.0f, logit_softcap = 0.0f;
+    memcpy(&max_bias,      ((const int32_t *) op->op_params) + 1, sizeof(float));
+    memcpy(&logit_softcap, ((const int32_t *) op->op_params) + 2, sizeof(float));
+
+    const bool ok = op->src[4] == nullptr && max_bias == 0.0f && logit_softcap == 0.0f &&
+        k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16 &&
+        q0->ne[0] == v->ne[0] && (q0->ne[0] == 256 || q0->ne[0] == 128) &&
+        k->ne[2] > 0 && q0->ne[2]/k->ne[2] > 1 && q0->ne[2] % k->ne[2] == 0 && q0->ne[3] % k->ne[3] == 0 &&
+        k->ne[1] % 64 == 0 &&
+        (m == nullptr || (m->type == GGML_TYPE_F16 && m->ne[2] <= 1 && m->ne[1] >= q0->ne[1])) &&
+        k->nb[0] == sizeof(ggml_fp16_t) && v->nb[0] == sizeof(ggml_fp16_t);
+
+    return ok ? q : 0;
+}
+
 bool ggml_metal_op_flash_attn_ext_use_vec(const ggml_tensor * op) {
     assert(op->op == GGML_OP_FLASH_ATTN_EXT);
 
@@ -3700,6 +3744,74 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
         ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
 
         ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + nqptg - 1)/nqptg, ne02, ne03, 32, nsg, 1);
+    } else if (!use_sparse && !ggml_metal_op_flash_attn_ext_use_vec(op) && ggml_metal_op_flash_attn_ext_gqa_prefill(op)) {
+        // prompt batches through kernels/fa_gqa.metal with one split (no reduce): rows packed by KV group, so one K/V
+        // tile load serves every head of the group (GGML_METAL_FA_GQA_PREFILL=8|16|24 picks the rows per threadgroup)
+        const int32_t gqa_q   = ggml_metal_op_flash_attn_ext_gqa_prefill(op);
+        const int32_t gqa_nsg = gqa_q == 8 ? 4 : 8;
+        const int32_t nwg     = 1;
+
+        constexpr int64_t GQA_C = 64;
+
+        const int32_t ns10_gqa = nb11_attn/nb10_attn;
+        const int32_t ns20_gqa = nb21_attn/nb20_attn;
+
+        const int64_t nr = (ne02/ne12)*ne01;
+
+        auto pipeline_gqa = ggml_metal_library_get_pipeline_flash_attn_ext_gqa(lib, op, has_mask, has_mask && ne03 > 1, gqa_q, gqa_nsg, nwg, ns10_gqa, ns20_gqa);
+
+        GGML_ASSERT(gqa_nsg*32 <= ggml_metal_pipeline_max_theads_per_threadgroup(pipeline_gqa));
+
+        const size_t smem_a   = std::max<size_t>(gqa_q*(ne00 + 3*GQA_C), gqa_q*ne20)*sizeof(ggml_fp16_t);
+        const size_t smem_gqa = GGML_PAD(smem_a + (gqa_q/8)*64*sizeof(float), 16);
+        GGML_ASSERT(smem_gqa <= props_dev->max_theadgroup_memory_size);
+        GGML_ASSERT((uint64_t) ne1*ne2*ne3 <= (1u << 31));
+
+        ggml_metal_kargs_flash_attn_ext args_gqa = {
+            /*.ne01          =*/ ne01,
+            /*.ne02          =*/ ne02,
+            /*.ne03          =*/ ne03,
+            /*.nb01          =*/ nb01,
+            /*.nb02          =*/ nb02,
+            /*.nb03          =*/ nb03,
+            /*.ne11          =*/ ne11,
+            /*.ne_12_2       =*/ ne12,
+            /*.ne_12_3       =*/ ne13,
+            /*.ns10          =*/ ns10_gqa,
+            /*.nb11          =*/ nb11_attn,
+            /*.nb12          =*/ nb12_attn,
+            /*.nb13          =*/ nb13_attn,
+            /*.ns20          =*/ ns20_gqa,
+            /*.nb21          =*/ nb21_attn,
+            /*.nb22          =*/ nb22_attn,
+            /*.nb23          =*/ nb23_attn,
+            /*.ne31          =*/ ne31,
+            /*.ne32          =*/ ne32,
+            /*.ne33          =*/ ne33,
+            /*.nb31          =*/ nb31,
+            /*.nb32          =*/ nb32,
+            /*.nb33          =*/ nb33,
+            /*.ne1           =*/ ne1,
+            /*.ne2           =*/ ne2,
+            /*.ne3           =*/ ne3,
+            /*.scale         =*/ scale,
+            /*.max_bias      =*/ max_bias,
+            /*.m0            =*/ m0,
+            /*.m1            =*/ m1,
+            /*.n_head_log2   =*/ n_head_log2,
+            /*.logit_softcap =*/ logit_softcap,
+        };
+
+        ggml_metal_encoder_set_pipeline(enc, pipeline_gqa);
+        ggml_metal_encoder_set_bytes   (enc, &args_gqa, sizeof(args_gqa), 0);
+        ggml_metal_encoder_set_buffer  (enc, bid_src0, 1);
+        ggml_metal_encoder_set_buffer  (enc, bid_k,    2);
+        ggml_metal_encoder_set_buffer  (enc, bid_v,    3);
+        ggml_metal_encoder_set_buffer  (enc, bid_src3, 4);
+        ggml_metal_encoder_set_buffer  (enc, bid_dst,  5);
+
+        ggml_metal_encoder_set_threadgroup_memory_size(enc, smem_gqa, 0);
+        ggml_metal_encoder_dispatch_threadgroups(enc, (nr + gqa_q - 1)/gqa_q, ne12, ne03*nwg, 32, gqa_nsg, 1);
     } else if (!use_sparse && !ggml_metal_op_flash_attn_ext_use_vec(op)) {
         // half8x8 kernel
         const int nqptg = OP_FLASH_ATTN_EXT_NQPSG; // queries per threadgroup

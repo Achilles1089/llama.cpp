@@ -12105,6 +12105,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
         }
     }
+    // RAVEN_FA_PREFILL (bench only): the same attention reading a prompt - 256-row ubatches (and a 64-row tail) at depth
+    for (int64_t kv : {4096, 22528, 45056}) {
+        for (int64_t nb : {64, 256}) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+        }
+    }
     // SWARM_FA (bench only): Qwen3.6-35B-A3B attention on the headless swarm - head 256, 2 KV heads x 8, decode on 1/4/16
     // split streams, all at kv and ragged (one stream at kv, the rest short: the block skip's case)
     for (int64_t kv : {1024, 2048, 4096, 8192, 16384, 32768}) {

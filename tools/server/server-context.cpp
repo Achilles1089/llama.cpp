@@ -3188,9 +3188,20 @@ private:
             const auto mtime = ec ? 0 : (int64_t) std::filesystem::last_write_time(std::filesystem::u8path(path), ec).time_since_epoch().count();
             return {{"path", path}, {"size", ec ? 0 : (uint64_t) size}, {"mtime", mtime}};
         };
+        // the n-gram drafters keep no state in the files (their tables are rebuilt from the prompt), so they are left out:
+        // adding one beside draft-mtp must not turn every saved chat cold
         json types = json::array();
         for (auto t : params_base.speculative.types) {
-            types.push_back(common_speculative_type_to_str(t));
+            switch (t) {
+                case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE:
+                case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K:
+                case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V:
+                case COMMON_SPECULATIVE_TYPE_NGRAM_MOD:
+                case COMMON_SPECULATIVE_TYPE_NGRAM_CACHE:
+                    continue;
+                default:
+                    types.push_back(common_speculative_type_to_str(t));
+            }
         }
         const json drafts = finfo(params_base.speculative.draft.mparams.path);
         // NOT the build id (2026-10-11: a rebuild of the server dropped every file on disk — 27 GB of his chats, every

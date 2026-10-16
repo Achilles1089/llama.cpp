@@ -403,7 +403,25 @@ struct common_params_speculative {
             return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 || t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
         });
 
-        return needs_rs_seq ? draft.n_max : 0u;
+        if (!needs_rs_seq) {
+            return 0u;
+        }
+
+        // an n-gram drafter tried ahead of the draft model proposes its own lengths: roll back as far as either drafts
+        // (each snapshot is one recurrent state per sequence, ~150 MB on Qwen3.8-27B, so keep the n-gram n-max small)
+        int32_t n = draft.n_max;
+        for (const auto t : types) {
+            switch (t) {
+                case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE:  n = std::max(n, (int32_t) ngram_simple.size_m);  break;
+                case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K:   n = std::max(n, (int32_t) ngram_map_k.size_m);   break;
+                case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V: n = std::max(n, (int32_t) ngram_map_k4v.size_m); break;
+                case COMMON_SPECULATIVE_TYPE_NGRAM_MOD:     n = std::max(n, ngram_mod.n_max);                break;
+                case COMMON_SPECULATIVE_TYPE_NGRAM_CACHE:   n = std::max(n, (int32_t) 8);                    break;
+                default: break;
+            }
+        }
+
+        return (uint32_t) std::max(n, 0);
     }
 };
 

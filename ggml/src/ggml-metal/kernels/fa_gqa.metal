@@ -283,8 +283,47 @@ kernel void kernel_flash_attn_ext_gqa(
     }
 
     // O to threadgroup memory (over sq/ss/sm, all done) in two column halves, then the partials in the vec kernel's
-    // layout (kernel_flash_attn_ext_vec_reduce combines the splits)
+    // layout (kernel_flash_attn_ext_vec_reduce combines the splits) - or, with one split (NWG == 1, prompt batches),
+    // O/S straight into dst
     const int64_t nrows = (int64_t) args.ne3*args.ne2*args.ne1;
+
+    if (NWG == 1) {
+        static_assert(NO % 2 == 0, "O leaves in two halves of the column tiles");
+
+        device float4 * dst4 = (device float4 *) dst;
+
+        FOR_UNROLL (short half_o = 0; half_o < 2; ++half_o) {
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            FOR_UNROLL (short rt = 0; rt < RT; ++rt) {
+                FOR_UNROLL (short i2 = 0; i2 < NO/2; ++i2) {
+                    simdgroup_store(lo[rt][half_o*(NO/2) + i2], so + rt*8*(DV/2) + 8*(NSG*i2 + sgitg), DV/2, 0, false);
+                }
+            }
+
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            FOR_UNROLL (short jj = 0; jj < NQ; ++jj) {
+                const short j = jj*NSG + sgitg;
+                const int   R = iq1 + j;
+
+                if (R < NR) {
+                    const int h  = ikv2*G + R%G;
+                    const int qp = R/G;
+
+                    const int64_t rid = (int64_t) iq3*args.ne2*args.ne1 + h + (int64_t) qp*args.ne1;
+
+                    const float inv = S[jj] == 0.0f ? 0.0f : 1.0f/S[jj];
+
+                    for (short i = tiisg; i < DV4/2; i += NW) {
+                        dst4[rid*DV4 + half_o*(DV4/2) + i] = so4[j*(DV4/2) + i]*inv;
+                    }
+                }
+            }
+        }
+
+        return;
+    }
 
     device float4 * dst4 = (device float4 *) dst;
     device float  * dst1 = (device float  *) dst + nrows*DV*NWG;

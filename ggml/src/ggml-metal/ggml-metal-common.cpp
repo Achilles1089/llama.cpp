@@ -481,6 +481,7 @@ static std::vector<int> ggml_metal_graph_optimize_reorder(const std::vector<node
             case GGML_OP_CPY:
             case GGML_OP_CONT:
             case GGML_OP_REPEAT:
+            case GGML_OP_CONCAT:
                 return true;
             default:
                 return ggml_op_is_empty(op);
