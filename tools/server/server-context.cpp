@@ -1697,6 +1697,7 @@ private:
         server_slot * ret = nullptr;
 
         bool update_cache = false;
+        bool keep_slot_memory = false; // [forge] a pack pick resuming from its own memory: save its old prompt, keep the rest
         float ret_f_keep = 0.0f;
         size_t ret_lcp = 0;
 
@@ -1774,7 +1775,11 @@ private:
         // slot: a warm slot must have its whole previous prompt extended (a straggler that only shares the
         // system prompt diverges inside it); a cold one must keep at least half. Otherwise the request takes
         // the free slot that is not warm and not pinned (id_slot) and leaves the fewest consecutive runs over
-        // the busy + warm slots; ties go to an empty slot, then the lowest id. Nothing eligible: upstream.
+        // the busy + warm slots; ties go to the slot that can RESUME furthest into this request from its own
+        // memory (2026-10-16: a 6-agent wave re-read its shared ~1.1k-token system + tools on empty slots while
+        // the slots of the last wave held them - ~20% of the wave's prefill), then to an empty slot, then the
+        // lowest id. A slot picked for its resume keeps its memory: its old conversation is copied to the RAM
+        // cache for its owner, and it is not swapped for a RAM entry or cleared. Nothing eligible: upstream.
         if (task.id_slot == -1 && slot_pack_idle_us > 0) {
             const int64_t t_now = ggml_time_us();
             const auto is_warm = [&](const server_slot & s) {
@@ -1795,9 +1800,29 @@ private:
                 for (const server_slot & s : slots) {
                     occ[s.id] = s.is_processing() || is_warm(s);
                 }
+                // tokens a slot can resume from without re-reading: the whole match when the slot's prompt is a
+                // prefix of the request or its memory rolls back freely, else its newest checkpoint inside the match
+                const bool part_rm = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_PART && n_swa == 0;
+                const auto resume_of = [&](const server_slot & s) -> size_t {
+                    if (s.prompt.tokens.empty()) {
+                        return 0;
+                    }
+                    const size_t lcp = s.prompt.tokens.get_common_prefix(task.tokens);
+                    if (lcp == 0 || part_rm || lcp >= s.prompt.tokens.size()) {
+                        return lcp;
+                    }
+                    size_t best_ckpt = 0;
+                    for (const auto & c : s.prompt.checkpoints) {
+                        if (c.n_tokens > 0 && (size_t) c.n_tokens <= lcp) {
+                            best_ckpt = std::max(best_ckpt, (size_t) c.n_tokens);
+                        }
+                    }
+                    return best_ckpt;
+                };
                 server_slot * best = nullptr;
-                int  best_runs  = n + 1;
-                bool best_empty = false;
+                int    best_runs   = n + 1;
+                size_t best_resume = 0;
+                bool   best_empty  = false;
                 for (server_slot & s : slots) {
                     if (occ[s.id]) {
                         continue;
@@ -1811,17 +1836,21 @@ private:
                         runs += occ[i] && (i == 0 || !occ[i - 1]);
                     }
                     occ[s.id] = 0;
-                    const bool empty = s.prompt.tokens.empty();
-                    if (runs < best_runs || (runs == best_runs && empty && !best_empty)) {
-                        best       = &s;
-                        best_runs  = runs;
-                        best_empty = empty;
+                    const bool   empty  = s.prompt.tokens.empty();
+                    const size_t resume = resume_of(s);
+                    if (runs < best_runs || (runs == best_runs && (resume > best_resume ||
+                            (resume == best_resume && empty && !best_empty)))) {
+                        best        = &s;
+                        best_runs   = runs;
+                        best_resume = resume;
+                        best_empty  = empty;
                     }
                 }
                 if (best != nullptr) {
                     ret = best;
-                    update_cache = true;
-                    SLT_INF(*ret, "selected slot by pack, runs = %d, empty = %d\n", best_runs, (int) best_empty);
+                    update_cache = best_resume == 0;
+                    keep_slot_memory = best_resume > 0;
+                    SLT_INF(*ret, "selected slot by pack, runs = %d, empty = %d, resume = %zu\n", best_runs, (int) best_empty, best_resume);
                 }
             }
         }
@@ -1848,6 +1877,11 @@ private:
 
                 update_cache = true;
             }
+        }
+
+        if (ret && keep_slot_memory && prompt_cache && task.type == SERVER_TASK_TYPE_COMPLETION) {
+            ret->prompt_save(*prompt_cache); // the old conversation stays reachable for its owner
+            prompt_cache->update();
         }
 
         if (ret) {
